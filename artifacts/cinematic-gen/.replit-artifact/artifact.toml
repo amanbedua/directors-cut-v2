@@ -1,0 +1,39 @@
+kind = "web"
+previewPath = "/"
+title = "Cinematic AI Video Generator"
+version = "1.0.0"
+id = "artifacts/cinematic-gen"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 21037
+
+[services.development]
+run = "pnpm --filter @workspace/cinematic-gen run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/cinematic-gen", "run", "build" ]
+publicDir = "artifacts/cinematic-gen/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "21037"
+BASE_PATH = "/"
+
+[[services]]
+name = "video-api"
+paths = [ "/video-api" ]
+localPort = 5000
+
+[services.development]
+run = "PORT=5000 python3 /home/runner/workspace/artifacts/video-backend/app.py"
