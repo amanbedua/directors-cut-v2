@@ -23,6 +23,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { useToast } from "@/hooks/use-toast";
 import { Progress } from "@/components/ui/progress";
+import { API_BASE_URL } from "@/config";
 
 type GenerateStatus =
   | "idle"
@@ -121,7 +122,7 @@ export default function Home() {
     const form = new FormData();
     files.forEach((f) => form.append("images", f));
     try {
-      const res = await fetch("/video-api/upload/images", {
+      const res = await fetch(`${API_BASE_URL}/video-api/upload/images`, {
         method: "POST",
         body: form,
       });
@@ -147,7 +148,7 @@ export default function Home() {
     const form = new FormData();
     form.append("audio", file);
     try {
-      const res = await fetch("/video-api/upload/audio", { method: "POST", body: form });
+      const res = await fetch(`${API_BASE_URL}/video-api/upload/audio`, { method: "POST", body: form });
       if (!res.ok) throw new Error("Audio upload failed");
       const data = await res.json();
       setAudio({ id: data.audio_id, path: data.path, duration: data.duration });
@@ -176,7 +177,7 @@ export default function Home() {
     setAiPlan(null);
     setChatMessages([]);
     try {
-      const res = await fetch("/video-api/analyze", {
+      const res = await fetch(`${API_BASE_URL}/video-api/analyze`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -216,7 +217,7 @@ export default function Home() {
     setChatMessages((prev) => [...prev, { role: "user", content: message }]);
     setIsChatting(true);
     try {
-      const res = await fetch("/video-api/chat", {
+      const res = await fetch(`${API_BASE_URL}/video-api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -249,7 +250,7 @@ export default function Home() {
     setProgress(0);
     setStatusMessage("Initializing render pipeline...");
     try {
-      const res = await fetch("/video-api/generate", {
+      const res = await fetch(`${API_BASE_URL}/video-api/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -274,7 +275,7 @@ export default function Home() {
     if (jobId && (status === "processing" || status === "queued" || (status === "analyzing" && !!jobId))) {
       interval = setInterval(async () => {
         try {
-          const res = await fetch(`/video-api/status/${jobId}`);
+          const res = await fetch(`${API_BASE_URL}/video-api/status/${jobId}`);
           if (!res.ok) return;
           const data = await res.json();
           setProgress(data.progress || 0);
@@ -781,7 +782,7 @@ export default function Home() {
                     <p className="text-[10px] text-muted-foreground font-mono mt-1">JOB: {jobId.substring(0, 8)}</p>
                   </div>
                   <Button asChild className="w-full font-mono" variant="secondary">
-                    <a href={`/video-api/download/${jobId}`} download>
+                    <a href={`${API_BASE_URL}/video-api/download/${jobId}`} download>
                       <Download className="w-4 h-4 mr-2" />
                       DOWNLOAD MASTER
                     </a>
