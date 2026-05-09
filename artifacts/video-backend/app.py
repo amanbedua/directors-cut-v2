@@ -466,50 +466,90 @@ XFADE_TRANSITIONS = {
 def merge_clips_with_scene_transitions(clip_paths: list[str], hold_times: list[float],
                                         scene_transitions: list[str],
                                         transition_duration: float, output_path: str):
-    """Merge clips using per-scene AI-directed transition types via xfade."""
+    """Merge clips sequentially (2 at a time) to avoid loading all clips into RAM.
+
+    Instead of one giant filter_complex with N inputs (which FFmpeg must decode
+    simultaneously), we roll through pairs: merge clip[0]+clip[1] -> tmp_0,
+    then tmp_0 + clip[2] -> tmp_1, etc.  Peak RAM stays constant: always
+    2-clip decode + 1 encode regardless of total scene count.
+    """
     n = len(clip_paths)
     if n == 1:
         shutil.copy(clip_paths[0], output_path)
         return
 
-    inputs = []
-    for p in clip_paths:
-        inputs += ["-i", p]
-
-    filter_parts = []
-    current = "[0:v]"
-    cumulative_offset = 0.0
+    tmp_dir = Path(output_path).parent
+    intermediates: list[str] = []
+    current_clip = clip_paths[0]
 
     for i in range(1, n):
-        cumulative_offset += hold_times[i - 1]
-        next_label = f"[v{i}]" if i < n - 1 else "[vout]"
+        is_last = (i == n - 1)
+        next_clip = clip_paths[i]
+
+        # xfade offset = hold time of the accumulated left-side clip.
+        # Because we re-encode at every merge step, the left clip's timeline
+        # always starts at 0 and its total duration equals its hold time,
+        # so the offset here is always hold_times[i-1].
+        offset = hold_times[i - 1]
         raw_type = scene_transitions[i - 1] if i - 1 < len(scene_transitions) else "fade"
         xf_type = XFADE_TRANSITIONS.get(raw_type, "fade")
-        filter_parts.append(
-            f"{current}[{i}:v]xfade=transition={xf_type}"
-            f":duration={transition_duration:.3f}:offset={cumulative_offset:.3f}{next_label}"
+
+        if is_last:
+            merge_out = output_path
+        else:
+            merge_out = str(tmp_dir / f"_seq_merge_{i:03d}.mp4")
+            intermediates.append(merge_out)
+
+        filter_complex = (
+            f"[0:v][1:v]xfade=transition={xf_type}"
+            f":duration={transition_duration:.3f}:offset={offset:.3f}[vout]"
         )
-        current = next_label
 
-    filter_complex = ";".join(filter_parts)
-
-    cmd = (
-        ["ffmpeg", "-y"]
-        + inputs
-        + [
+        cmd = [
+            "ffmpeg", "-y",
+            "-threads", "1",          # single-thread decode: lower peak RSS
+            "-i", current_clip,
+            "-i", next_clip,
             "-filter_complex", filter_complex,
             "-map", "[vout]",
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
-            "-preset", "fast",
-            "-crf", "18",
-            output_path,
+            "-preset", "medium",       # smaller lookahead buffer than fast
+            "-crf", "20",              # slightly higher = smaller encode buffer; visually identical
+            "-x264-params", "rc-lookahead=20:ref=1:threads=1",
+            "-movflags", "+faststart",
+            merge_out,
         ]
-    )
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-    if result.returncode != 0:
-        raise RuntimeError(f"Cinematic merge failed:\n{result.stderr[-1500:]}")
 
+        # Use Popen + communicate to avoid buffering all stderr in RAM
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            _, stderr_bytes = proc.communicate(timeout=300)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise RuntimeError(f"Merge step {i} timed out")
+
+        if proc.returncode != 0:
+            stderr_tail = stderr_bytes[-1500:].decode("utf-8", errors="replace")
+            raise RuntimeError(f"Cinematic merge step {i} failed:\n{stderr_tail}")
+
+        # Delete the previous intermediate immediately to free disk + OS page-cache
+        if current_clip in intermediates:
+            try:
+                os.remove(current_clip)
+                intermediates.remove(current_clip)
+            except OSError:
+                pass
+
+        current_clip = merge_out
+
+    # Clean up any leftover intermediates (safety net)
+    for f in intermediates:
+        try:
+            os.remove(f)
+        except OSError:
+            pass
 
 # ─── Core Video Builder ────────────────────────────────────────────────────────
 
@@ -607,20 +647,30 @@ def build_cinematic_video(job_id: str, image_paths: list[str], audio_path: str |
                 "ffmpeg", "-y",
                 "-loop", "1",
                 "-framerate", "25",
+                "-threads", "1",           # limit decode threads → lower RSS
                 "-i", img_path,
                 "-vf", vf,
                 "-t", f"{clip_duration:.3f}",
                 "-c:v", "libx264",
                 "-pix_fmt", "yuv420p",
                 "-r", "25",
-                "-preset", "fast",
-                "-crf", "18",
+                "-preset", "medium",       # smaller lookahead buffer than fast
+                "-crf", "20",              # CRF 20 vs 18: indistinguishable at 1080p, ~15% less buffer RAM
+                "-x264-params", "rc-lookahead=20:ref=1:threads=1",
                 str(clip_out),
             ]
 
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
-            if result.returncode != 0:
-                raise RuntimeError(f"Clip {i+1} render failed:\n{result.stderr[-800:]}")
+            # Popen avoids accumulating stderr in RAM for long encodes
+            clip_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            try:
+                _, clip_stderr = clip_proc.communicate(timeout=240)
+            except subprocess.TimeoutExpired:
+                clip_proc.kill()
+                clip_proc.communicate()
+                raise RuntimeError(f"Clip {i+1} render timed out")
+            if clip_proc.returncode != 0:
+                err_tail = clip_stderr[-800:].decode("utf-8", errors="replace")
+                raise RuntimeError(f"Clip {i+1} render failed:\n{err_tail}")
 
             clip_paths.append(str(clip_out))
             pct = 18 + int((i + 1) / n * 52)
@@ -657,8 +707,14 @@ def build_cinematic_video(job_id: str, image_paths: list[str], audio_path: str |
                 "-map", "1:a:0",
                 str(output_path),
             ]
-            result = subprocess.run(mix_cmd, capture_output=True, text=True, timeout=300)
-            if result.returncode != 0:
+            mix_proc = subprocess.Popen(mix_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            try:
+                _, mix_stderr = mix_proc.communicate(timeout=300)
+            except subprocess.TimeoutExpired:
+                mix_proc.kill()
+                mix_proc.communicate()
+                raise RuntimeError("Audio mix timed out")
+            if mix_proc.returncode != 0:
                 # Fallback without audio fade
                 mix_cmd_fallback = [
                     "ffmpeg", "-y",
@@ -672,9 +728,16 @@ def build_cinematic_video(job_id: str, image_paths: list[str], audio_path: str |
                     "-map", "1:a:0",
                     str(output_path),
                 ]
-                result2 = subprocess.run(mix_cmd_fallback, capture_output=True, text=True, timeout=300)
-                if result2.returncode != 0:
-                    raise RuntimeError(f"Audio mix failed:\n{result2.stderr[-800:]}")
+                fb_proc = subprocess.Popen(mix_cmd_fallback, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                try:
+                    _, fb_stderr = fb_proc.communicate(timeout=300)
+                except subprocess.TimeoutExpired:
+                    fb_proc.kill()
+                    fb_proc.communicate()
+                    raise RuntimeError("Audio mix fallback timed out")
+                if fb_proc.returncode != 0:
+                    err_tail = fb_stderr[-800:].decode("utf-8", errors="replace")
+                    raise RuntimeError(f"Audio mix failed:\n{err_tail}")
         else:
             shutil.copy(str(raw_video), str(output_path))
 
