@@ -481,31 +481,45 @@ def merge_clips_with_scene_transitions(clip_paths: list[str], hold_times: list[f
                                         scene_transitions: list[str],
                                         transition_duration: float, output_path: str,
                                         quality: str = "720p"):
-    """Merge clips sequentially (2 at a time) to avoid loading all clips into RAM.
+    """Merge N clips sequentially (2 at a time) with correct xfade offsets.
 
-    Instead of one giant filter_complex with N inputs (which FFmpeg must decode
-    simultaneously), we roll through pairs: merge clip[0]+clip[1] -> tmp_0,
-    then tmp_0 + clip[2] -> tmp_1, etc.  Peak RAM stays constant: always
-    2-clip decode + 1 encode regardless of total scene count.
+    Key fix: in sequential merging the LEFT input grows after each step.
+    After merging clips 0..k into an accumulated clip, its duration is:
+        sum(hold_times[0..k]) + transition_duration
+    So the xfade offset for the NEXT merge must be that accumulated duration,
+    NOT just hold_times[i-1] (which was the original bug causing only 2 scenes).
+
+    Approach: use ffprobe to read the actual duration of the accumulated clip
+    before each merge step — this is 100% accurate regardless of float drift.
     """
     n = len(clip_paths)
     if n == 1:
         shutil.copy(clip_paths[0], output_path)
         return
 
+    _prof = QUALITY_PROFILES.get(quality, QUALITY_PROFILES["720p"])
     tmp_dir = Path(output_path).parent
     intermediates: list[str] = []
     current_clip = clip_paths[0]
+
+    def get_duration(path: str) -> float:
+        """Use ffprobe to get exact duration of a video file."""
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=15,
+        )
+        return float(r.stdout.strip())
 
     for i in range(1, n):
         is_last = (i == n - 1)
         next_clip = clip_paths[i]
 
-        # xfade offset = hold time of the accumulated left-side clip.
-        # Because we re-encode at every merge step, the left clip's timeline
-        # always starts at 0 and its total duration equals its hold time,
-        # so the offset here is always hold_times[i-1].
-        offset = hold_times[i - 1]
+        # Correct offset: actual duration of the accumulated left clip
+        # minus the transition overlap (xfade offset = where transition starts)
+        left_duration = get_duration(current_clip)
+        offset = max(0.1, left_duration - transition_duration)
+
         raw_type = scene_transitions[i - 1] if i - 1 < len(scene_transitions) else "fade"
         xf_type = XFADE_TRANSITIONS.get(raw_type, "fade")
 
@@ -520,7 +534,6 @@ def merge_clips_with_scene_transitions(clip_paths: list[str], hold_times: list[f
             f":duration={transition_duration:.3f}:offset={offset:.3f}[vout]"
         )
 
-        _prof = QUALITY_PROFILES.get(quality, QUALITY_PROFILES["720p"])
         cmd = [
             "ffmpeg", "-y",
             "-threads", "1",
@@ -537,10 +550,9 @@ def merge_clips_with_scene_transitions(clip_paths: list[str], hold_times: list[f
             merge_out,
         ]
 
-        # Use Popen + communicate to avoid buffering all stderr in RAM
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         try:
-            _, stderr_bytes = proc.communicate(timeout=300)
+            _, stderr_bytes = proc.communicate(timeout=600)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate()
@@ -550,7 +562,7 @@ def merge_clips_with_scene_transitions(clip_paths: list[str], hold_times: list[f
             stderr_tail = stderr_bytes[-1500:].decode("utf-8", errors="replace")
             raise RuntimeError(f"Cinematic merge step {i} failed:\n{stderr_tail}")
 
-        # Delete the previous intermediate immediately to free disk + OS page-cache
+        # Delete previous intermediate immediately to free disk space
         if current_clip in intermediates:
             try:
                 os.remove(current_clip)
@@ -560,7 +572,7 @@ def merge_clips_with_scene_transitions(clip_paths: list[str], hold_times: list[f
 
         current_clip = merge_out
 
-    # Clean up any leftover intermediates (safety net)
+    # Safety net cleanup
     for f in intermediates:
         try:
             os.remove(f)
