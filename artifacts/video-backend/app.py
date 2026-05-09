@@ -54,6 +54,8 @@ MOTION_STYLES = [
 ]
 
 TRANSITION_TYPES = ["fade", "dissolve", "wipeleft", "wiperight", "circleopen"]
+ZOOM_INTENSITIES = ["low", "medium", "high"]
+PACING_VALUES = ["slow", "moderate", "dynamic", "dramatic"]
 
 
 def call_gemini(contents: list, response_json: bool = True) -> dict:
@@ -95,7 +97,6 @@ def generate_ai_director_plan(audio_path: str | None, audio_duration: float | No
     n = len(scene_names)
 
     if audio_path and os.path.exists(audio_path) and GEMINI_BASE_URL:
-        # Check file size (8 MB limit for inline data)
         audio_size = os.path.getsize(audio_path)
         if audio_size > 8 * 1024 * 1024:
             return generate_fallback_plan(n, audio_duration)
@@ -122,6 +123,8 @@ Return ONLY valid JSON with this exact structure:
 {{
   "pacing": "one of: slow, moderate, dynamic, dramatic",
   "mood": "brief mood descriptor e.g. 'contemplative', 'urgent', 'hopeful', 'melancholic'",
+  "zoom_intensity": "one of: low, medium, high",
+  "transition_duration": <float between 0.8 and 2.0>,
   "scenes": [
     {{
       "scene_number": 1,
@@ -135,15 +138,17 @@ Return ONLY valid JSON with this exact structure:
 }}
 
 Rules:
-- scene durations must sum to approximately {duration_info}
+- scene durations MUST sum to exactly {duration_info}
 - vary motion styles — no two consecutive scenes should use identical motion
 - match motion intensity to emotional arc of voiceover
 - opening scenes: prefer slow_push_in or static_breathe
-- peak/climax scenes: prefer dramatic_push or drift_left/right
+- peak/climax scenes: prefer dramatic_push or arc_left/arc_right
 - closing scenes: prefer slow_pull_back or static_breathe
 - transitions: use fade or dissolve for emotional moments, wipes for energetic cuts
-- minimum scene duration: 2.5 seconds
-- maximum scene duration: 15 seconds"""
+- minimum scene duration: 3.0 seconds
+- maximum scene duration: 18 seconds
+- zoom_intensity: low for subtle/emotional content, medium for general, high for dramatic/action
+- transition_duration: 0.8-1.2 for fast pacing, 1.2-2.0 for slow/emotional"""
 
         contents = [
             {
@@ -165,35 +170,49 @@ Rules:
             print(f"[AI Director] Gemini analysis failed: {e}. Using fallback.")
             return generate_fallback_plan(n, audio_duration)
     else:
-        # No audio or no Gemini — generate a smart default cinematic plan
         return generate_fallback_plan(n, audio_duration)
 
 
 def validate_and_fix_plan(plan: dict, n: int, audio_duration: float | None) -> dict:
     scenes = plan.get("scenes", [])
-    # Ensure we have exactly n scenes
     if len(scenes) < n:
         fallback = generate_fallback_plan(n, audio_duration)
         return fallback
     scenes = scenes[:n]
 
-    # Fix any invalid motion/transition values
     for i, s in enumerate(scenes):
         if s.get("motion") not in MOTION_STYLES:
             s["motion"] = MOTION_STYLES[i % len(MOTION_STYLES)]
         if s.get("transition") not in TRANSITION_TYPES:
             s["transition"] = "fade"
+        if s.get("intensity") not in ["opening", "building", "peak", "falling", "closing"]:
+            s["intensity"] = ["opening", "building", "peak", "falling", "closing"][i % 5]
         s["scene_number"] = i + 1
-        s["duration"] = max(2.5, float(s.get("duration", 4.0)))
+        s["duration"] = max(3.0, float(s.get("duration", 5.0)))
 
-    # Re-balance durations to match audio
+    # Re-balance durations to match audio precisely
     if audio_duration and audio_duration > 0:
         total = sum(s["duration"] for s in scenes)
         scale = audio_duration / total
         for s in scenes:
-            s["duration"] = max(2.5, s["duration"] * scale)
+            s["duration"] = max(3.0, s["duration"] * scale)
+        # Final adjustment to ensure exact sum
+        total_after = sum(s["duration"] for s in scenes)
+        diff = audio_duration - total_after
+        scenes[-1]["duration"] = max(3.0, scenes[-1]["duration"] + diff)
 
     plan["scenes"] = scenes
+
+    # Validate top-level fields
+    if plan.get("pacing") not in PACING_VALUES:
+        plan["pacing"] = "moderate"
+    if not isinstance(plan.get("mood"), str) or not plan["mood"]:
+        plan["mood"] = "cinematic"
+    if plan.get("zoom_intensity") not in ZOOM_INTENSITIES:
+        plan["zoom_intensity"] = "medium"
+    td = float(plan.get("transition_duration", 1.2))
+    plan["transition_duration"] = max(0.5, min(2.5, td))
+
     return plan
 
 
@@ -201,7 +220,6 @@ def generate_fallback_plan(n: int, audio_duration: float | None) -> dict:
     """Generate a cinematically intelligent default plan without AI."""
     per_scene = (audio_duration / n) if (audio_duration and audio_duration > 0) else 5.0
 
-    # Cinematic arc: opening → building → peak → falling → closing
     intensity_arc = ["opening", "building", "peak", "falling", "closing"]
     motion_arc = {
         "opening":  ["slow_push_in", "static_breathe"],
@@ -220,8 +238,8 @@ def generate_fallback_plan(n: int, audio_duration: float | None) -> dict:
 
     scenes = []
     for i in range(n):
-        # Map scene index to emotional arc position
-        arc_pos = intensity_arc[min(int(i / max(n - 1, 1) * (len(intensity_arc) - 1)), len(intensity_arc) - 1)]
+        arc_idx = min(int(i / max(n - 1, 1) * (len(intensity_arc) - 1)), len(intensity_arc) - 1)
+        arc_pos = intensity_arc[arc_idx]
         motions = motion_arc[arc_pos]
         motion = motions[i % len(motions)]
 
@@ -231,29 +249,99 @@ def generate_fallback_plan(n: int, audio_duration: float | None) -> dict:
             "motion": motion,
             "transition": transition_arc[arc_pos],
             "intensity": arc_pos,
-            "direction_note": f"Scene {i+1} — {arc_pos}",
+            "direction_note": f"Scene {i + 1} — {arc_pos}",
         })
 
     return {
         "pacing": "moderate",
         "mood": "cinematic",
+        "zoom_intensity": "medium",
+        "transition_duration": 1.2,
         "scenes": scenes,
     }
+
+
+# ─── AI Chat Director ──────────────────────────────────────────────────────────
+
+def apply_chat_directive(message: str, current_plan: dict, scene_names: list[str],
+                          audio_duration: float | None) -> dict:
+    """Interpret a natural language directive and update the cinematic plan safely."""
+    if not GEMINI_BASE_URL:
+        return current_plan
+
+    n = len(current_plan.get("scenes", []))
+    if n == 0:
+        return current_plan
+
+    duration_info = f"{audio_duration:.1f} seconds" if audio_duration else "not specified"
+    scene_list = "\n".join([f"  {i+1}. {name}" for i, name in enumerate(scene_names[:n])])
+
+    prompt = f"""You are an AI cinematic director assistant. Apply the user's instruction to intelligently update the cinematic plan.
+
+CURRENT PLAN:
+{json.dumps(current_plan, indent=2)}
+
+SCENES:
+{scene_list}
+
+AUDIO DURATION: {duration_info}
+
+USER INSTRUCTION: "{message}"
+
+Interpret the instruction and return a COMPLETE UPDATED PLAN as valid JSON with the exact same structure.
+
+ALLOWED VALUES (strictly enforced — never use other values):
+- motion: slow_push_in, slow_pull_back, drift_left, drift_right, dramatic_push, arc_left, arc_right, static_breathe
+- transition: fade, dissolve, wipeleft, wiperight, circleopen
+- pacing: slow, moderate, dynamic, dramatic
+- zoom_intensity: low, medium, high
+- intensity: opening, building, peak, falling, closing
+- transition_duration: 0.5 to 2.5 (float)
+- duration: minimum 3.0 seconds per scene
+
+INTERPRETATION GUIDE:
+- "emotional / melancholic / sad / reflective" → slow_push_in, static_breathe, slow_pull_back; pacing: slow; zoom_intensity: low; transitions: dissolve, fade
+- "dramatic / intense / powerful / cinematic" → dramatic_push, arc_left, arc_right; pacing: dramatic; zoom_intensity: high; transitions: wipeleft, wiperight
+- "subtle / gentle / soft / calm" → static_breathe, slow_push_in; zoom_intensity: low; pacing: slow
+- "dynamic / energetic / fast / upbeat" → drift_left, drift_right, arc_left, arc_right; pacing: dynamic; zoom_intensity: medium
+- "smoother transitions" → transition_duration: 1.8-2.2; transitions: dissolve, fade throughout
+- "longer final scene / extend ending" → increase last 1-2 scene durations significantly, reduce earlier scenes
+- "build to climax" → escalate from static_breathe → slow_push_in → drift → arc → dramatic_push
+- "add dramatic zooms" → zoom_intensity: high; use dramatic_push and arc_left/arc_right at peak moments
+- "more cinematic flow" → vary motions systematically, use dissolve transitions, pacing: moderate
+- "faster pacing" → reduce scene durations, pacing: dynamic, transitions: wipeleft/wiperight
+- "slower pacing" → increase scene durations, pacing: slow, transitions: dissolve/fade
+
+CONSTRAINTS:
+- If audio_duration is specified, total scene durations MUST sum to exactly {audio_duration:.1f if audio_duration else 'N/A'} seconds
+- Keep scenes in logical cinematic order (opening → building → peak → falling → closing arc)
+- Never use the same motion for two consecutive scenes
+
+Return ONLY the complete JSON plan, no explanation or markdown."""
+
+    contents = [{"role": "user", "parts": [{"text": prompt}]}]
+
+    try:
+        gemini_resp = call_gemini(contents, response_json=True)
+        text = extract_gemini_text(gemini_resp)
+        updated_plan = json.loads(text)
+        updated_plan = validate_and_fix_plan(updated_plan, n, audio_duration)
+        return updated_plan
+    except Exception as e:
+        print(f"[Chat Director] Failed to apply directive '{message}': {e}")
+        return current_plan
 
 
 # ─── Scene Ordering ────────────────────────────────────────────────────────────
 
 def extract_scene_number(filename: str) -> tuple[int, str]:
-    """Extract leading/embedded scene number for sorting."""
     stem = Path(filename).stem.lower()
-    # Match "scene3", "scene_3", "3", "03", "img3" etc.
     m = re.search(r"(\d+)", stem)
     num = int(m.group(1)) if m else 9999
     return (num, filename)
 
 
 def sort_images_by_scene(image_paths: list[str]) -> list[str]:
-    """Sort image paths by scene number embedded in filename."""
     def key(p):
         return extract_scene_number(Path(p).name)
     return sorted(image_paths, key=key)
@@ -279,78 +367,92 @@ def get_audio_duration(audio_path: str) -> float | None:
 
 # ─── FFmpeg Motion Engine ──────────────────────────────────────────────────────
 
-def get_zoom_filter(style: str, duration: float) -> str:
+def get_zoom_filter(style: str, duration: float, zoom_intensity: str = "medium") -> str:
     fps = 25
-    frames = max(int(duration * fps), 25)
+    frames = max(int(duration * fps), 30)  # minimum 30 frames for smooth motion
     W, H = 1920, 1080
 
-    # Scale factor for zoompan source — 2× overscale for smooth motion
+    # Scale factor for zoompan source — 2× overscale prevents edge artifacts
     SW, SH = W * 2, H * 2
 
     # Center anchor expressions
     cx = "iw/2-(iw/zoom/2)"
     cy = "ih/2-(ih/zoom/2)"
 
-    # Movement magnitude per frame (slow = cinematic)
-    slow_drift = int(W * 0.25 / frames)   # pan distance spread across clip
-    fast_drift = int(W * 0.35 / frames)
+    # Zoom intensity multipliers — controls the range of motion
+    intensity_mult = {"low": 0.55, "medium": 1.0, "high": 1.5}
+    mult = intensity_mult.get(zoom_intensity, 1.0)
+
+    # Drift speed — proportional to frame count for smooth continuous motion
+    slow_drift = int(W * 0.22 / frames)
+    fast_drift = int(W * 0.30 / frames)
+    # Ensure minimum drift of 1 pixel/frame for visible motion
+    slow_drift = max(1, slow_drift)
+    fast_drift = max(1, fast_drift)
 
     if style == "slow_push_in":
-        # Slow, dramatic zoom in from 1.0 → 1.45 centered
+        push_end = min(1.0 + 0.38 * mult, 1.65)
+        push_rate = (push_end - 1.0) / frames
         zp = (f"scale={SW}:{SH}:force_original_aspect_ratio=increase,crop={SW}:{SH},"
-              f"zoompan=z='min(1.0+on*0.45/{frames},1.45)':"
+              f"zoompan=z='min(1.0+on*{push_rate:.5f},{push_end:.3f})':"
               f"x='{cx}':y='{cy}':d={frames}:s={W}x{H}:fps={fps}")
 
     elif style == "slow_pull_back":
-        # Start zoomed in, slowly pull back to wide
+        pull_start = min(1.0 + 0.38 * mult, 1.65)
+        pull_rate = (pull_start - 1.0) / frames
         zp = (f"scale={SW}:{SH}:force_original_aspect_ratio=increase,crop={SW}:{SH},"
-              f"zoompan=z='if(eq(on\\,1)\\,1.45\\,max(1.45-on*0.45/{frames}\\,1.0))':"
+              f"zoompan=z='if(eq(on\\,1)\\,{pull_start:.3f}\\,max({pull_start:.3f}-on*{pull_rate:.5f}\\,1.0))':"
               f"x='{cx}':y='{cy}':d={frames}:s={W}x{H}:fps={fps}")
 
     elif style == "drift_left":
-        # Pan left with gentle zoom
+        zoom_val = 1.0 + 0.2 * mult
         zp = (f"scale={SW}:{SH}:force_original_aspect_ratio=increase,crop={SW}:{SH},"
-              f"zoompan=z='1.25':"
+              f"zoompan=z='{zoom_val:.3f}':"
               f"x='iw/2-(iw/zoom/2)+{slow_drift}*on':y='{cy}':"
               f"d={frames}:s={W}x{H}:fps={fps}")
 
     elif style == "drift_right":
-        # Pan right with gentle zoom
+        zoom_val = 1.0 + 0.2 * mult
         zp = (f"scale={SW}:{SH}:force_original_aspect_ratio=increase,crop={SW}:{SH},"
-              f"zoompan=z='1.25':"
+              f"zoompan=z='{zoom_val:.3f}':"
               f"x='iw/2-(iw/zoom/2)-{slow_drift}*on':y='{cy}':"
               f"d={frames}:s={W}x{H}:fps={fps}")
 
     elif style == "dramatic_push":
-        # Aggressive zoom into lower-third for climactic moments
+        push_end = min(1.0 + 0.55 * mult, 1.80)
+        push_rate = (push_end - 1.0) / frames
         zp = (f"scale={SW}:{SH}:force_original_aspect_ratio=increase,crop={SW}:{SH},"
-              f"zoompan=z='min(1.0+on*0.6/{frames},1.6)':"
-              f"x='iw/2-(iw/zoom/2)':y='ih*0.6-(ih/zoom/2)':"
+              f"zoompan=z='min(1.0+on*{push_rate:.5f},{push_end:.3f})':"
+              f"x='iw/2-(iw/zoom/2)':y='ih*0.58-(ih/zoom/2)':"
               f"d={frames}:s={W}x{H}:fps={fps}")
 
     elif style == "arc_left":
-        # Slow pan left + simultaneous push in (arc camera move)
+        arc_end = min(1.1 + 0.28 * mult, 1.55)
+        arc_rate = (arc_end - 1.1) / frames
         zp = (f"scale={SW}:{SH}:force_original_aspect_ratio=increase,crop={SW}:{SH},"
-              f"zoompan=z='min(1.1+on*0.3/{frames},1.4)':"
+              f"zoompan=z='min(1.1+on*{arc_rate:.5f},{arc_end:.3f})':"
               f"x='iw/2-(iw/zoom/2)+{fast_drift}*on':y='{cy}':"
               f"d={frames}:s={W}x{H}:fps={fps}")
 
     elif style == "arc_right":
-        # Slow pan right + simultaneous push in
+        arc_end = min(1.1 + 0.28 * mult, 1.55)
+        arc_rate = (arc_end - 1.1) / frames
         zp = (f"scale={SW}:{SH}:force_original_aspect_ratio=increase,crop={SW}:{SH},"
-              f"zoompan=z='min(1.1+on*0.3/{frames},1.4)':"
+              f"zoompan=z='min(1.1+on*{arc_rate:.5f},{arc_end:.3f})':"
               f"x='iw/2-(iw/zoom/2)-{fast_drift}*on':y='{cy}':"
               f"d={frames}:s={W}x{H}:fps={fps}")
 
-    else:  # static_breathe — almost imperceptible zoom, meditative
+    else:  # static_breathe — barely perceptible, meditative
+        breathe_end = 1.0 + 0.09 * mult
+        breathe_rate = (breathe_end - 1.0) / frames
         zp = (f"scale={SW}:{SH}:force_original_aspect_ratio=increase,crop={SW}:{SH},"
-              f"zoompan=z='min(1.0+on*0.12/{frames},1.12)':"
+              f"zoompan=z='min(1.0+on*{breathe_rate:.5f},{breathe_end:.3f})':"
               f"x='{cx}':y='{cy}':d={frames}:s={W}x{H}:fps={fps}")
 
     return zp
 
 
-# ─── FFmpeg Merge with Xfade ───────────────────────────────────────────────────
+# ─── FFmpeg Merge with Per-Scene Xfade Transitions ────────────────────────────
 
 XFADE_TRANSITIONS = {
     "fade": "fade",
@@ -361,58 +463,10 @@ XFADE_TRANSITIONS = {
 }
 
 
-def merge_clips_cinematic(clip_paths: list[str], hold_times: list[float],
-                           transition_duration: float, output_path: str):
-    n = len(clip_paths)
-    if n == 1:
-        shutil.copy(clip_paths[0], output_path)
-        return
-
-    inputs = []
-    for p in clip_paths:
-        inputs += ["-i", p]
-
-    # Build xfade filter chain
-    # xfade offset = cumulative sum of hold_times up to that transition point
-    filter_parts = []
-    current = "[0:v]"
-    cumulative_offset = 0.0
-
-    for i in range(1, n):
-        cumulative_offset += hold_times[i - 1]
-        next_label = f"[v{i}]" if i < n - 1 else "[vout]"
-        xf_type = "fade"  # default; scene-level transition type stored in job metadata
-        filter_parts.append(
-            f"{current}[{i}:v]xfade=transition={xf_type}"
-            f":duration={transition_duration}:offset={cumulative_offset:.3f}{next_label}"
-        )
-        current = next_label
-
-    filter_complex = ";".join(filter_parts)
-    final_label = "[vout]" if n > 1 else current
-
-    cmd = (
-        ["ffmpeg", "-y"]
-        + inputs
-        + [
-            "-filter_complex", filter_complex,
-            "-map", final_label,
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-preset", "fast",
-            "-crf", "18",
-            output_path,
-        ]
-    )
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-    if result.returncode != 0:
-        raise RuntimeError(f"Cinematic merge failed:\n{result.stderr[-1000:]}")
-
-
 def merge_clips_with_scene_transitions(clip_paths: list[str], hold_times: list[float],
                                         scene_transitions: list[str],
                                         transition_duration: float, output_path: str):
-    """Merge clips using per-scene transition types from the AI director plan."""
+    """Merge clips using per-scene AI-directed transition types via xfade."""
     n = len(clip_paths)
     if n == 1:
         shutil.copy(clip_paths[0], output_path)
@@ -429,7 +483,6 @@ def merge_clips_with_scene_transitions(clip_paths: list[str], hold_times: list[f
     for i in range(1, n):
         cumulative_offset += hold_times[i - 1]
         next_label = f"[v{i}]" if i < n - 1 else "[vout]"
-        # Use the transition type from the PREVIOUS scene (transition out of scene i-1)
         raw_type = scene_transitions[i - 1] if i - 1 < len(scene_transitions) else "fade"
         xf_type = XFADE_TRANSITIONS.get(raw_type, "fade")
         filter_parts.append(
@@ -439,14 +492,13 @@ def merge_clips_with_scene_transitions(clip_paths: list[str], hold_times: list[f
         current = next_label
 
     filter_complex = ";".join(filter_parts)
-    final_label = "[vout]"
 
     cmd = (
         ["ffmpeg", "-y"]
         + inputs
         + [
             "-filter_complex", filter_complex,
-            "-map", final_label,
+            "-map", "[vout]",
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
             "-preset", "fast",
@@ -456,7 +508,7 @@ def merge_clips_with_scene_transitions(clip_paths: list[str], hold_times: list[f
     )
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
     if result.returncode != 0:
-        raise RuntimeError(f"Cinematic merge failed:\n{result.stderr[-1000:]}")
+        raise RuntimeError(f"Cinematic merge failed:\n{result.stderr[-1500:]}")
 
 
 # ─── Core Video Builder ────────────────────────────────────────────────────────
@@ -466,50 +518,70 @@ def build_cinematic_video(job_id: str, image_paths: list[str], audio_path: str |
     try:
         jobs[job_id]["status"] = "analyzing"
         jobs[job_id]["progress"] = 3
-        jobs[job_id]["message"] = "AI Director is reading the voiceover..."
+        jobs[job_id]["message"] = "AI Director is reading the project..."
 
         n = len(image_paths)
         audio_duration = options.get("audio_duration")
-        transition_duration = float(options.get("transition_duration", 1.2))
         per_image_fallback = float(options.get("per_image_duration", 5.0))
-        ai_plan_override = options.get("ai_plan")  # optional pre-computed plan
+        ai_plan_override = options.get("ai_plan")
 
-        # Get scene names for context
         scene_names = [Path(p).name for p in image_paths]
 
         # Step 1: Get AI Director plan
         if ai_plan_override:
             plan = ai_plan_override
+            # Re-validate to ensure all fields are safe
+            plan = validate_and_fix_plan(plan, n, audio_duration)
         else:
             plan = generate_ai_director_plan(audio_path, audio_duration, scene_names)
 
         jobs[job_id]["ai_plan"] = plan
         jobs[job_id]["progress"] = 12
-        jobs[job_id]["message"] = f"AI Director: {plan.get('mood', 'cinematic')} pacing locked in. Building sequences..."
+        zoom_intensity = plan.get("zoom_intensity", "medium")
+        transition_duration = float(plan.get("transition_duration", 1.2))
+        jobs[job_id]["message"] = (
+            f"AI Director: {plan.get('mood', 'cinematic')} · {zoom_intensity} zoom · "
+            f"{plan.get('pacing', 'moderate')} pacing. Building sequences..."
+        )
 
         scenes = plan.get("scenes", [])
 
-        # Resolve per-scene durations
+        # Resolve per-scene durations from AI plan
         scene_durations = []
         for i in range(n):
             if i < len(scenes):
                 dur = float(scenes[i].get("duration", per_image_fallback))
             else:
                 dur = per_image_fallback
-            scene_durations.append(max(2.5, dur))
+            scene_durations.append(max(3.0, dur))
 
-        # If audio, normalize total duration
+        # If audio, precisely normalize total duration to match audio
         if audio_duration and audio_duration > 0:
             total = sum(scene_durations)
-            if abs(total - audio_duration) > 0.5:
+            if abs(total - audio_duration) > 0.1:
                 scale = audio_duration / total
-                scene_durations = [max(2.5, d * scale) for d in scene_durations]
+                scene_durations = [max(3.0, d * scale) for d in scene_durations]
+            # Final precision fix
+            total_after = sum(scene_durations)
+            diff = audio_duration - total_after
+            scene_durations[-1] = max(3.0, scene_durations[-1] + diff)
 
-        # Hold time = scene duration (xfade overlap adds extra time)
-        hold_times = [max(1.5, d - transition_duration) for d in scene_durations]
-
-        # Clip total duration = hold_time + transition overlap
+        # Hold time = scene duration minus transition overlap
+        hold_times = [max(2.0, d - transition_duration) for d in scene_durations]
+        # Clip duration = hold_time + transition overlap
         clip_durations = [ht + transition_duration for ht in hold_times]
+
+        # ── AUDIO SYNC FIX ──────────────────────────────────────────────────────
+        # Total xfade output = sum(hold_times) + transition_duration (last clip tail)
+        # Ensure total video >= audio_duration + small buffer so -shortest doesn't cut early
+        if audio_duration and audio_duration > 0:
+            total_hold = sum(hold_times)
+            expected_video_dur = total_hold + transition_duration
+            if expected_video_dur < audio_duration + 0.8:
+                deficit = (audio_duration + 0.8) - expected_video_dur
+                hold_times[-1] += deficit
+                clip_durations[-1] = hold_times[-1] + transition_duration
+        # ────────────────────────────────────────────────────────────────────────
 
         jobs[job_id]["progress"] = 18
         jobs[job_id]["message"] = "Rendering cinematic clips..."
@@ -520,7 +592,7 @@ def build_cinematic_video(job_id: str, image_paths: list[str], audio_path: str |
 
         for i, img_path in enumerate(image_paths):
             clip_out = temp_dir / f"clip_{i:03d}.mp4"
-            # Get motion style from AI plan
+
             if i < len(scenes):
                 motion = scenes[i].get("motion", "slow_push_in")
                 if motion not in MOTION_STYLES:
@@ -529,7 +601,7 @@ def build_cinematic_video(job_id: str, image_paths: list[str], audio_path: str |
                 motion = MOTION_STYLES[i % len(MOTION_STYLES)]
 
             clip_duration = clip_durations[i]
-            vf = get_zoom_filter(motion, clip_duration)
+            vf = get_zoom_filter(motion, clip_duration, zoom_intensity)
 
             cmd = [
                 "ffmpeg", "-y",
@@ -546,20 +618,19 @@ def build_cinematic_video(job_id: str, image_paths: list[str], audio_path: str |
                 str(clip_out),
             ]
 
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
             if result.returncode != 0:
-                raise RuntimeError(f"Clip {i+1} render failed:\n{result.stderr[-600:]}")
+                raise RuntimeError(f"Clip {i+1} render failed:\n{result.stderr[-800:]}")
 
             clip_paths.append(str(clip_out))
             pct = 18 + int((i + 1) / n * 52)
             motion_label = motion.replace("_", " ").upper()
             jobs[job_id]["progress"] = pct
-            jobs[job_id]["message"] = f"Scene {i+1}/{n} — {motion_label}"
+            jobs[job_id]["message"] = f"Scene {i+1}/{n} — {motion_label} ({zoom_intensity} zoom)"
 
         jobs[job_id]["progress"] = 72
         jobs[job_id]["message"] = "Weaving cinematic transitions..."
 
-        # Merge with per-scene transition types
         scene_transitions = [s.get("transition", "fade") for s in scenes]
         raw_video = temp_dir / "raw_video.mp4"
         merge_clips_with_scene_transitions(
@@ -567,11 +638,12 @@ def build_cinematic_video(job_id: str, image_paths: list[str], audio_path: str |
         )
 
         jobs[job_id]["progress"] = 88
-        jobs[job_id]["message"] = "Laying down the voiceover..."
+        jobs[job_id]["message"] = "Syncing audio to picture..."
 
         output_path = OUTPUT_DIR / f"{job_id}.mp4"
 
         if audio_path and os.path.exists(audio_path):
+            # Mix audio — trim video to audio end, pad audio if video is shorter
             mix_cmd = [
                 "ffmpeg", "-y",
                 "-i", str(raw_video),
@@ -579,6 +651,7 @@ def build_cinematic_video(job_id: str, image_paths: list[str], audio_path: str |
                 "-c:v", "copy",
                 "-c:a", "aac",
                 "-b:a", "192k",
+                "-af", "afade=t=out:st={:.3f}:d=1.0".format(max(0, (audio_duration or 0) - 1.0)),
                 "-shortest",
                 "-map", "0:v:0",
                 "-map", "1:a:0",
@@ -586,9 +659,30 @@ def build_cinematic_video(job_id: str, image_paths: list[str], audio_path: str |
             ]
             result = subprocess.run(mix_cmd, capture_output=True, text=True, timeout=300)
             if result.returncode != 0:
-                raise RuntimeError(f"Audio mix failed:\n{result.stderr[-600:]}")
+                # Fallback without audio fade
+                mix_cmd_fallback = [
+                    "ffmpeg", "-y",
+                    "-i", str(raw_video),
+                    "-i", audio_path,
+                    "-c:v", "copy",
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+                    "-shortest",
+                    "-map", "0:v:0",
+                    "-map", "1:a:0",
+                    str(output_path),
+                ]
+                result2 = subprocess.run(mix_cmd_fallback, capture_output=True, text=True, timeout=300)
+                if result2.returncode != 0:
+                    raise RuntimeError(f"Audio mix failed:\n{result2.stderr[-800:]}")
         else:
             shutil.copy(str(raw_video), str(output_path))
+
+        # Cleanup temp dir
+        try:
+            shutil.rmtree(temp_dir)
+        except Exception:
+            pass
 
         jobs[job_id]["progress"] = 100
         jobs[job_id]["status"] = "done"
@@ -599,6 +693,13 @@ def build_cinematic_video(job_id: str, image_paths: list[str], audio_path: str |
     except Exception as e:
         jobs[job_id]["status"] = "error"
         jobs[job_id]["message"] = str(e)
+        # Cleanup on failure
+        try:
+            temp_dir = OUTPUT_DIR / f"tmp_{job_id}"
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
+        except Exception:
+            pass
 
 
 # ─── Routes ────────────────────────────────────────────────────────────────────
@@ -633,7 +734,6 @@ def upload_images():
         if not allowed_file(filename, ALLOWED_IMAGE_EXTS):
             return jsonify({"error": f"Invalid image type: {ext}"}), 400
         dest = session_dir / filename
-        # Avoid collisions
         if dest.exists():
             dest = session_dir / f"_{uuid.uuid4().hex[:6]}_{filename}"
         f.save(str(dest))
@@ -643,14 +743,9 @@ def upload_images():
     if not saved:
         return jsonify({"error": "No valid images uploaded"}), 400
 
-    # Sort by scene number in filename
     sorted_paths = sort_images_by_scene(saved)
 
-    # Write metadata
-    meta = {
-        "original_names": original_names,
-        "sorted_paths": sorted_paths,
-    }
+    meta = {"original_names": original_names, "sorted_paths": sorted_paths}
     with open(session_dir / "meta.json", "w") as f:
         json.dump(meta, f)
 
@@ -686,7 +781,7 @@ def upload_audio():
 
 @app.route("/video-api/analyze", methods=["POST"])
 def analyze_route():
-    """Pre-render AI analysis endpoint — lets the frontend display the plan before rendering."""
+    """Pre-render AI analysis endpoint — frontend displays plan before rendering."""
     data = request.get_json()
     if not data:
         return jsonify({"error": "JSON body required"}), 400
@@ -719,6 +814,39 @@ def analyze_route():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/video-api/chat", methods=["POST"])
+def chat_director():
+    """AI Chat Director — interprets natural language and updates the cinematic plan."""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+
+    message = data.get("message", "").strip()
+    current_plan = data.get("current_plan", {})
+    scene_names = data.get("scene_names", [])
+    audio_duration = data.get("audio_duration")
+
+    if not message:
+        return jsonify({"error": "Message is required"}), 400
+    if not current_plan or not current_plan.get("scenes"):
+        return jsonify({"error": "A valid current_plan with scenes is required"}), 400
+
+    updated_plan = apply_chat_directive(message, current_plan, scene_names, audio_duration)
+
+    pacing = updated_plan.get("pacing", "moderate")
+    mood = updated_plan.get("mood", "cinematic")
+    zoom_intensity = updated_plan.get("zoom_intensity", "medium")
+    td = updated_plan.get("transition_duration", 1.2)
+    n_scenes = len(updated_plan.get("scenes", []))
+
+    acknowledgment = (
+        f"Plan updated — {pacing} pacing · {mood} mood · {zoom_intensity} zoom intensity · "
+        f"{td:.1f}s transitions across {n_scenes} scenes."
+    )
+
+    return jsonify({"plan": updated_plan, "acknowledgment": acknowledgment})
+
+
 @app.route("/video-api/generate", methods=["POST"])
 def generate_video():
     data = request.get_json()
@@ -728,9 +856,8 @@ def generate_video():
     session_id = data.get("session_id")
     audio_path = data.get("audio_path")
     audio_duration = data.get("audio_duration")
-    transition_duration = data.get("transition_duration", 1.2)
     per_image_duration = data.get("per_image_duration", 5.0)
-    ai_plan = data.get("ai_plan")  # optional pre-computed plan from /analyze
+    ai_plan = data.get("ai_plan")
 
     if not session_id:
         return jsonify({"error": "session_id is required"}), 400
@@ -759,7 +886,6 @@ def generate_video():
 
     options = {
         "audio_duration": audio_duration,
-        "transition_duration": float(transition_duration),
         "per_image_duration": float(per_image_duration),
         "ai_plan": ai_plan,
     }

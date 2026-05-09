@@ -1,2 +1,4 @@
 artifacts/video-backend/outputs/2d2391f0-84e7-4037-a3ac-acdfbf13fe8c.mp4 filter=lfs diff=lfs merge=lfs -text
 artifacts/video-backend/outputs/tmp_2d2391f0-84e7-4037-a3ac-acdfbf13fe8c/raw_video.mp4 filter=lfs diff=lfs merge=lfs -text
+artifacts/video-backend/outputs/32c63d94-c601-4cb4-a233-4c903b40b719.mp4 filter=lfs diff=lfs merge=lfs -text
+artifacts/video-backend/outputs/tmp_32c63d94-c601-4cb4-a233-4c903b40b719/raw_video.mp4 filter=lfs diff=lfs merge=lfs -text
