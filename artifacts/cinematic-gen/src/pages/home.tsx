@@ -102,6 +102,7 @@ export default function Home() {
   const [progress, setProgress] = useState(0);
   const [statusMessage, setStatusMessage] = useState("");
   const [perImageDuration, setPerImageDuration] = useState(5);
+  const [quality, setQuality] = useState<"480p" | "720p" | "1080p">("720p");
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [isChatting, setIsChatting] = useState(false);
@@ -259,6 +260,7 @@ export default function Home() {
           audio_duration: audio?.duration || null,
           per_image_duration: perImageDuration,
           ai_plan: aiPlan,
+          quality,
         }),
       });
       if (!res.ok) throw new Error("Generation failed to start");
@@ -659,6 +661,46 @@ export default function Home() {
                 </CardContent>
               </Card>
             )}
+
+            {/* Quality selector — always visible */}
+            <Card className="border-border/50 bg-card/50 backdrop-blur">
+              <CardHeader className="pb-3">
+                <CardTitle className="font-mono text-xs tracking-widest text-muted-foreground flex items-center gap-2">
+                  <Settings2 className="w-4 h-4" />
+                  OUTPUT QUALITY
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <p className="text-[10px] text-muted-foreground font-mono">
+                  Lower quality = less RAM = more stable on free servers.
+                </p>
+                <div className="grid grid-cols-3 gap-2">
+                  {(["480p", "720p", "1080p"] as const).map((q) => (
+                    <button
+                      key={q}
+                      onClick={() => setQuality(q)}
+                      className={[
+                        "h-10 rounded-md border font-mono text-xs tracking-widest transition-all",
+                        quality === q
+                          ? "border-primary bg-primary/10 text-primary font-bold"
+                          : "border-border/50 bg-black/20 text-muted-foreground hover:border-border hover:text-foreground",
+                      ].join(" ")}
+                    >
+                      {q}
+                      {q === "720p" && (
+                        <span className="block text-[8px] opacity-60 mt-0.5">recommended</span>
+                      )}
+                      {q === "480p" && (
+                        <span className="block text-[8px] opacity-60 mt-0.5">fastest</span>
+                      )}
+                      {q === "1080p" && (
+                        <span className="block text-[8px] opacity-60 mt-0.5">high quality</span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
 
             {/* Analyze button — when images loaded but no plan yet */}
             {canAnalyze && !audio && !aiPlan && (

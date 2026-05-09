@@ -55,6 +55,18 @@ MOTION_STYLES = [
 
 TRANSITION_TYPES = ["fade", "dissolve", "wipeleft", "wiperight", "circleopen"]
 ZOOM_INTENSITIES = ["low", "medium", "high"]
+
+# ─── Quality Profiles ──────────────────────────────────────────────────────────
+# Each profile defines output resolution, encoder settings, and RAM usage.
+# DEFAULT_QUALITY can be overridden per-request via the "quality" param.
+QUALITY_PROFILES = {
+    "480p":  {"W": 854,  "H": 480,  "crf": 24, "preset": "faster", "lookahead": 10},
+    "720p":  {"W": 1280, "H": 720,  "crf": 22, "preset": "medium", "lookahead": 20},
+    "1080p": {"W": 1920, "H": 1080, "crf": 20, "preset": "medium", "lookahead": 20},
+}
+DEFAULT_QUALITY = os.environ.get("RENDER_QUALITY", "720p")
+if DEFAULT_QUALITY not in QUALITY_PROFILES:
+    DEFAULT_QUALITY = "720p"
 PACING_VALUES = ["slow", "moderate", "dynamic", "dramatic"]
 
 
@@ -367,10 +379,12 @@ def get_audio_duration(audio_path: str) -> float | None:
 
 # ─── FFmpeg Motion Engine ──────────────────────────────────────────────────────
 
-def get_zoom_filter(style: str, duration: float, zoom_intensity: str = "medium") -> str:
+def get_zoom_filter(style: str, duration: float, zoom_intensity: str = "medium",
+                    quality: str = "720p") -> str:
     fps = 25
     frames = max(int(duration * fps), 30)  # minimum 30 frames for smooth motion
-    W, H = 1920, 1080
+    prof = QUALITY_PROFILES.get(quality, QUALITY_PROFILES["720p"])
+    W, H = prof["W"], prof["H"]
 
     # Scale factor for zoompan source — 2× overscale prevents edge artifacts
     SW, SH = W * 2, H * 2
@@ -465,7 +479,8 @@ XFADE_TRANSITIONS = {
 
 def merge_clips_with_scene_transitions(clip_paths: list[str], hold_times: list[float],
                                         scene_transitions: list[str],
-                                        transition_duration: float, output_path: str):
+                                        transition_duration: float, output_path: str,
+                                        quality: str = "720p"):
     """Merge clips sequentially (2 at a time) to avoid loading all clips into RAM.
 
     Instead of one giant filter_complex with N inputs (which FFmpeg must decode
@@ -505,18 +520,19 @@ def merge_clips_with_scene_transitions(clip_paths: list[str], hold_times: list[f
             f":duration={transition_duration:.3f}:offset={offset:.3f}[vout]"
         )
 
+        _prof = QUALITY_PROFILES.get(quality, QUALITY_PROFILES["720p"])
         cmd = [
             "ffmpeg", "-y",
-            "-threads", "1",          # single-thread decode: lower peak RSS
+            "-threads", "1",
             "-i", current_clip,
             "-i", next_clip,
             "-filter_complex", filter_complex,
             "-map", "[vout]",
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
-            "-preset", "medium",       # smaller lookahead buffer than fast
-            "-crf", "20",              # slightly higher = smaller encode buffer; visually identical
-            "-x264-params", "rc-lookahead=20:ref=1:threads=1",
+            "-preset", _prof["preset"],
+            "-crf", str(_prof["crf"]),
+            "-x264-params", f"rc-lookahead={_prof['lookahead']}:ref=1:threads=1",
             "-movflags", "+faststart",
             merge_out,
         ]
@@ -579,6 +595,10 @@ def build_cinematic_video(job_id: str, image_paths: list[str], audio_path: str |
         jobs[job_id]["progress"] = 12
         zoom_intensity = plan.get("zoom_intensity", "medium")
         transition_duration = float(plan.get("transition_duration", 1.2))
+        quality = options.get("quality", DEFAULT_QUALITY)
+        if quality not in QUALITY_PROFILES:
+            quality = DEFAULT_QUALITY
+        prof = QUALITY_PROFILES[quality]
         jobs[job_id]["message"] = (
             f"AI Director: {plan.get('mood', 'cinematic')} · {zoom_intensity} zoom · "
             f"{plan.get('pacing', 'moderate')} pacing. Building sequences..."
@@ -641,22 +661,22 @@ def build_cinematic_video(job_id: str, image_paths: list[str], audio_path: str |
                 motion = MOTION_STYLES[i % len(MOTION_STYLES)]
 
             clip_duration = clip_durations[i]
-            vf = get_zoom_filter(motion, clip_duration, zoom_intensity)
+            vf = get_zoom_filter(motion, clip_duration, zoom_intensity, quality)
 
             cmd = [
                 "ffmpeg", "-y",
                 "-loop", "1",
                 "-framerate", "25",
-                "-threads", "1",           # limit decode threads → lower RSS
+                "-threads", "1",
                 "-i", img_path,
                 "-vf", vf,
                 "-t", f"{clip_duration:.3f}",
                 "-c:v", "libx264",
                 "-pix_fmt", "yuv420p",
                 "-r", "25",
-                "-preset", "medium",       # smaller lookahead buffer than fast
-                "-crf", "20",              # CRF 20 vs 18: indistinguishable at 1080p, ~15% less buffer RAM
-                "-x264-params", "rc-lookahead=20:ref=1:threads=1",
+                "-preset", prof["preset"],
+                "-crf", str(prof["crf"]),
+                "-x264-params", f"rc-lookahead={prof['lookahead']}:ref=1:threads=1",
                 str(clip_out),
             ]
 
@@ -684,7 +704,7 @@ def build_cinematic_video(job_id: str, image_paths: list[str], audio_path: str |
         scene_transitions = [s.get("transition", "fade") for s in scenes]
         raw_video = temp_dir / "raw_video.mp4"
         merge_clips_with_scene_transitions(
-            clip_paths, hold_times, scene_transitions, transition_duration, str(raw_video)
+            clip_paths, hold_times, scene_transitions, transition_duration, str(raw_video), quality
         )
 
         jobs[job_id]["progress"] = 88
@@ -769,7 +789,7 @@ def build_cinematic_video(job_id: str, image_paths: list[str], audio_path: str |
 
 @app.route("/video-api/health")
 def health():
-    return jsonify({"status": "ok", "gemini": bool(GEMINI_BASE_URL)})
+    return jsonify({"status": "ok", "gemini": bool(GEMINI_BASE_URL), "default_quality": DEFAULT_QUALITY})
 
 
 @app.route("/video-api/upload/images", methods=["POST"])
@@ -947,10 +967,15 @@ def generate_video():
         "ai_plan": None,
     }
 
+    quality = data.get("quality", DEFAULT_QUALITY)
+    if quality not in QUALITY_PROFILES:
+        quality = DEFAULT_QUALITY
+
     options = {
         "audio_duration": audio_duration,
         "per_image_duration": float(per_image_duration),
         "ai_plan": ai_plan,
+        "quality": quality,
     }
 
     thread = threading.Thread(
