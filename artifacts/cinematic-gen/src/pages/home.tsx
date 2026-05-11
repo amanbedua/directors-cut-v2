@@ -4,6 +4,27 @@ import { API_BASE_URL } from "@/config";
 type Quality = "480p" | "720p" | "1080p";
 type Status = "idle" | "processing" | "done" | "error";
 
+// Compress image to max 1200px wide, 80% JPEG quality — keeps payload small
+function compressImage(file: File, maxW = 1200): Promise<string> {
+  return new Promise((res, rej) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      const scale = Math.min(1, maxW / img.width);
+      const w = Math.round(img.width * scale);
+      const h = Math.round(img.height * scale);
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      canvas.getContext("2d")!.drawImage(img, 0, 0, w, h);
+      URL.revokeObjectURL(url);
+      res(canvas.toDataURL("image/jpeg", 0.82));
+    };
+    img.onerror = rej;
+    img.src = url;
+  });
+}
+
 function fileToB64(file: File): Promise<string> {
   return new Promise((res, rej) => {
     const r = new FileReader();
@@ -18,6 +39,7 @@ export default function Home() {
   const audioInputRef = useRef<HTMLInputElement>(null);
 
   const [images, setImages] = useState<File[]>([]);
+  const [imagePreviews, setImagePreviews] = useState<string[]>([]);
   const [audioFile, setAudioFile] = useState<File | null>(null);
   const [quality, setQuality] = useState<Quality>("480p");
   const [duration, setDuration] = useState(4);
@@ -34,17 +56,24 @@ export default function Home() {
   const [backendOk, setBackendOk] = useState<boolean | null>(null);
 
   React.useEffect(() => {
-    fetch(API_BASE_URL + "/health", { signal: AbortSignal.timeout(6000) })
+    fetch(API_BASE_URL + "/health", { signal: AbortSignal.timeout(8000) })
       .then(r => setBackendOk(r.ok))
       .catch(() => setBackendOk(false));
   }, []);
 
-  const addImages = useCallback((files: File[]) => {
-    const imgs = files.filter(f => f.type.startsWith("image/"));
+  const addImages = useCallback(async (files: File[]) => {
+    const imgs = files.filter(f => f.type.startsWith("image/")).slice(0, 20 - images.length);
+    if (!imgs.length) return;
+    // Generate previews
+    const previews = imgs.map(f => URL.createObjectURL(f));
     setImages(prev => [...prev, ...imgs].slice(0, 20));
-  }, []);
+    setImagePreviews(prev => [...prev, ...previews].slice(0, 20));
+  }, [images.length]);
 
-  const removeImage = (i: number) => setImages(prev => prev.filter((_, idx) => idx !== i));
+  const removeImage = (i: number) => {
+    setImages(prev => prev.filter((_, idx) => idx !== i));
+    setImagePreviews(prev => prev.filter((_, idx) => idx !== i));
+  };
 
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault();
@@ -58,11 +87,9 @@ export default function Home() {
     const step = (to - from) / (ms / 400);
     setProgressMsg(msg);
     progTimerRef.current = setInterval(() => {
-      cur = Math.min(cur + step + Math.random() * 0.3, to);
+      cur = Math.min(cur + step + Math.random() * 0.4, to);
       setProgress(Math.round(cur));
-      if (cur >= to) {
-        if (progTimerRef.current) clearInterval(progTimerRef.current);
-      }
+      if (cur >= to && progTimerRef.current) clearInterval(progTimerRef.current);
     }, 400);
   };
 
@@ -76,21 +103,24 @@ export default function Home() {
     const t0 = Date.now();
 
     try {
-      setProgressMsg("Reading images…");
+      // Compress images client-side (keeps payload < 5MB total)
+      setProgressMsg("Compressing images…");
       setProgress(5);
-      const b64Images = await Promise.all(images.map(fileToB64));
+      const compressed = await Promise.all(images.map(f => compressImage(f)));
 
-      setProgress(18);
+      setProgress(15);
+      setProgressMsg("Reading audio…");
       let b64Audio: string | null = null;
       if (audioFile) b64Audio = await fileToB64(audioFile);
 
-      simProgress(20, 85, `Rendering ${images.length} scenes on server…`, 120000);
+      const totalKB = Math.round(compressed.reduce((s, b) => s + b.length * 0.75 / 1024, 0));
+      simProgress(18, 82, `Sending ${images.length} scenes (${totalKB} KB) to server…`, 150000);
 
       const resp = await fetch(API_BASE_URL + "/generate-video", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          images: b64Images,
+          images: compressed,
           audio: b64Audio,
           quality,
           prompt: prompt.trim(),
@@ -102,10 +132,10 @@ export default function Home() {
 
       if (!resp.ok) {
         const err = await resp.json().catch(() => ({ error: "Server error " + resp.status }));
-        throw new Error(err.error || "Server error");
+        throw new Error(err.error || "Server error " + resp.status);
       }
 
-      setProgressMsg("Finalising…");
+      setProgressMsg("Downloading video…");
       setProgress(92);
       const blob = await resp.blob();
       const url = URL.createObjectURL(blob);
@@ -120,7 +150,8 @@ export default function Home() {
       setStatus("done");
     } catch (e: unknown) {
       if (progTimerRef.current) clearInterval(progTimerRef.current);
-      setErrorMsg((e as Error).message || "Unknown error");
+      const msg = (e as Error).message || "Unknown error";
+      setErrorMsg(msg);
       setStatus("error");
     }
   };
@@ -134,16 +165,9 @@ export default function Home() {
   };
 
   const reset = () => {
-    setImages([]);
-    setAudioFile(null);
-    setVideoUrl(null);
-    setVideoBlob(null);
-    setStatus("idle");
-    setProgress(0);
-    setProgressMsg("");
-    setErrorMsg("");
-    setMeta(null);
-    setPrompt("");
+    setImages([]); setImagePreviews([]); setAudioFile(null);
+    setVideoUrl(null); setVideoBlob(null); setStatus("idle");
+    setProgress(0); setProgressMsg(""); setErrorMsg(""); setMeta(null); setPrompt("");
     if (imageInputRef.current) imageInputRef.current.value = "";
     if (audioInputRef.current) audioInputRef.current.value = "";
     window.scrollTo({ top: 0, behavior: "smooth" });
@@ -153,7 +177,6 @@ export default function Home() {
 
   return (
     <div style={S.page}>
-      {/* Header */}
       <header style={S.header}>
         <div style={S.brand}>
           <span style={S.brandName}>Director's Cut</span>
@@ -181,13 +204,13 @@ export default function Home() {
               onChange={e => { addImages([...(e.target.files || [])]); e.target.value = ""; }} />
             <div style={S.uploadIcon}>⬆</div>
             <div style={S.uploadTitle}>Drop images here or tap to upload</div>
-            <div style={S.uploadSub}>JPG, PNG, WEBP · Max 20 images</div>
+            <div style={S.uploadSub}>JPG, PNG, WEBP · Max 20 images · Auto-compressed</div>
           </div>
           {images.length > 0 && (
             <div style={S.imgGrid}>
-              {images.map((f, i) => (
+              {imagePreviews.map((src, i) => (
                 <div key={i} style={S.thumb}>
-                  <img src={URL.createObjectURL(f)} alt="" style={S.thumbImg} />
+                  <img src={src} alt="" style={S.thumbImg} />
                   <span style={S.sceneNum}>{i + 1}</span>
                   <button style={S.delBtn} onClick={e => { e.stopPropagation(); removeImage(i); }}>×</button>
                 </div>
@@ -206,13 +229,11 @@ export default function Home() {
             <div style={{ flex: 1 }}>
               {audioFile
                 ? <span style={S.audioName}>{audioFile.name}</span>
-                : <><div style={{ fontSize: 13, fontWeight: 500, color: "#888" }}>Add background music</div><div style={{ fontSize: 11, color: "#555" }}>MP3, WAV, M4A (optional)</div></>
-              }
+                : <><div style={{ fontSize: 13, fontWeight: 500, color: "#888" }}>Add background music</div><div style={{ fontSize: 11, color: "#555" }}>MP3, WAV, M4A (optional)</div></>}
             </div>
-            {audioFile && (
-              <button style={S.clearBtn} onClick={e => { e.stopPropagation(); setAudioFile(null); if (audioInputRef.current) audioInputRef.current.value = ""; }}>×</button>
-            )}
-            {!audioFile && <span style={{ color: "#555", fontSize: 13 }}>Browse →</span>}
+            {audioFile
+              ? <button style={S.clearBtn} onClick={e => { e.stopPropagation(); setAudioFile(null); if (audioInputRef.current) audioInputRef.current.value = ""; }}>×</button>
+              : <span style={{ color: "#555", fontSize: 13 }}>Browse →</span>}
           </div>
         </div>
 
@@ -238,17 +259,13 @@ export default function Home() {
           <div style={{ marginTop: 14 }}>
             <div style={S.settingLabel}>AI Director Prompt (optional)</div>
             <textarea value={prompt} onChange={e => setPrompt(e.target.value)}
-              placeholder="e.g. cinematic thriller with fast cuts, emotional wedding moments…"
+              placeholder="e.g. cinematic thriller, emotional wedding, travel vlog…"
               style={S.textarea} />
           </div>
         </div>
 
-        {/* Error */}
-        {status === "error" && (
-          <div style={S.errorBox}>⚠ {errorMsg}</div>
-        )}
+        {status === "error" && <div style={S.errorBox}>⚠ {errorMsg}</div>}
 
-        {/* Generate button */}
         <button
           style={{ ...S.btnGenerate, opacity: (!images.length || isProcessing) ? 0.35 : 1, cursor: (!images.length || isProcessing) ? "not-allowed" : "pointer" }}
           disabled={!images.length || isProcessing}
@@ -261,10 +278,10 @@ export default function Home() {
         {isProcessing && (
           <div style={S.card}>
             <div style={S.stepsRow}>
-              {["Upload", "Render", "Merge", "Done"].map((label, i) => {
-                const stepPct = [0, 20, 85, 100];
-                const done = progress >= stepPct[i + 1] || (i === 3 && progress === 100);
-                const active = progress >= stepPct[i] && !done;
+              {(["Compress", "Upload", "Render", "Done"] as const).map((label, i) => {
+                const pcts = [0, 15, 20, 100];
+                const done = progress > pcts[i + 1 < 4 ? i + 1 : 3] || (i === 3 && progress === 100);
+                const active = progress >= pcts[i] && !done;
                 return (
                   <div key={i} style={S.step}>
                     <div style={{ ...S.stepDot, ...(done ? S.stepDone : active ? S.stepActive : {}) }}>
@@ -307,10 +324,10 @@ export default function Home() {
 }
 
 const S: Record<string, React.CSSProperties> = {
-  page: { background: "#0b0b0b", color: "#f0f0f0", minHeight: "100vh", fontFamily: "'DM Sans', 'Inter', sans-serif" },
+  page: { background: "#0b0b0b", color: "#f0f0f0", minHeight: "100vh", fontFamily: "'DM Sans','Inter',sans-serif" },
   header: { padding: "24px 20px 18px", borderBottom: "1px solid #1e1e1e", display: "flex", alignItems: "center", justifyContent: "space-between" },
   brand: { display: "flex", alignItems: "baseline", gap: 10 },
-  brandName: { fontFamily: "Georgia, serif", fontSize: 22, fontWeight: 600, letterSpacing: "0.02em" },
+  brandName: { fontFamily: "Georgia,serif", fontSize: 22, fontWeight: 600, letterSpacing: "0.02em" },
   brandTag: { fontSize: 11, fontWeight: 500, letterSpacing: "0.12em", textTransform: "uppercase", color: "#d4ff3d", background: "rgba(212,255,61,0.1)", padding: "3px 8px", borderRadius: 4 },
   statusRow: { display: "flex", alignItems: "center", gap: 6 },
   dot: { width: 7, height: 7, borderRadius: "50%", display: "inline-block", flexShrink: 0 },
@@ -318,17 +335,17 @@ const S: Record<string, React.CSSProperties> = {
   main: { maxWidth: 560, margin: "0 auto", padding: "24px 16px 80px", display: "flex", flexDirection: "column", gap: 16 },
   card: { background: "#161616", border: "1px solid #222", borderRadius: 12, padding: 20 },
   cardLabel: { fontSize: 11, fontWeight: 500, letterSpacing: "0.1em", textTransform: "uppercase", color: "#444", marginBottom: 14 },
-  uploadZone: { border: "1.5px dashed #2a2a2a", borderRadius: 8, padding: "28px 20px", textAlign: "center", cursor: "pointer", transition: "all 0.2s", position: "relative" },
+  uploadZone: { border: "1.5px dashed #2a2a2a", borderRadius: 8, padding: "28px 20px", textAlign: "center", cursor: "pointer", position: "relative" },
   uploadZoneHover: { borderColor: "#d4ff3d", background: "rgba(212,255,61,0.05)" },
   hiddenInput: { position: "absolute", inset: 0, opacity: 0, cursor: "pointer", width: "100%", height: "100%" },
   uploadIcon: { fontSize: 26, color: "#444", marginBottom: 8 },
   uploadTitle: { fontSize: 14, fontWeight: 500, color: "#666", marginBottom: 4 },
   uploadSub: { fontSize: 12, color: "#444" },
-  imgGrid: { display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, marginTop: 14 },
+  imgGrid: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 8, marginTop: 14 },
   thumb: { position: "relative", aspectRatio: "1", borderRadius: 8, overflow: "hidden", background: "#1e1e1e", border: "1px solid #2a2a2a" },
   thumbImg: { width: "100%", height: "100%", objectFit: "cover", display: "block" },
   sceneNum: { position: "absolute", top: 5, left: 5, background: "rgba(0,0,0,0.75)", color: "#d4ff3d", fontSize: 10, fontWeight: 500, padding: "2px 6px", borderRadius: 4 },
-  delBtn: { position: "absolute", top: 5, right: 5, width: 22, height: 22, borderRadius: "50%", background: "rgba(0,0,0,0.8)", border: "none", color: "#fff", fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", lineHeight: 1 },
+  delBtn: { position: "absolute", top: 5, right: 5, width: 22, height: 22, borderRadius: "50%", background: "rgba(0,0,0,0.8)", border: "none", color: "#fff", fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" },
   audioRow: { display: "flex", alignItems: "center", gap: 12, padding: "14px 16px", border: "1.5px dashed #2a2a2a", borderRadius: 8, cursor: "pointer", position: "relative" },
   audioName: { fontSize: 13, fontWeight: 500, color: "#f0f0f0", maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "block" },
   clearBtn: { background: "none", border: "none", color: "#555", fontSize: 20, cursor: "pointer", padding: 4, lineHeight: 1, flexShrink: 0 },
@@ -337,10 +354,10 @@ const S: Record<string, React.CSSProperties> = {
   select: { width: "100%", background: "#1e1e1e", border: "1px solid #2a2a2a", borderRadius: 8, color: "#f0f0f0", fontFamily: "inherit", fontSize: 14, padding: "10px 12px", outline: "none" },
   textarea: { width: "100%", background: "#1e1e1e", border: "1px solid #2a2a2a", borderRadius: 8, color: "#f0f0f0", fontFamily: "inherit", fontSize: 14, padding: "10px 12px", outline: "none", resize: "none", height: 68, lineHeight: 1.5, boxSizing: "border-box" },
   errorBox: { background: "rgba(255,85,85,0.08)", border: "1px solid rgba(255,85,85,0.25)", borderRadius: 8, padding: "14px 16px", fontSize: 13, color: "#ff9090" },
-  btnGenerate: { width: "100%", padding: 16, background: "#d4ff3d", color: "#0b0b0b", border: "none", borderRadius: 12, fontFamily: "inherit", fontSize: 15, fontWeight: 500, cursor: "pointer", transition: "opacity 0.2s" },
+  btnGenerate: { width: "100%", padding: 16, background: "#d4ff3d", color: "#0b0b0b", border: "none", borderRadius: 12, fontFamily: "inherit", fontSize: 15, fontWeight: 500, cursor: "pointer" },
   stepsRow: { display: "flex", justifyContent: "space-between", marginBottom: 20 },
   step: { display: "flex", flexDirection: "column", alignItems: "center", flex: 1, gap: 6 },
-  stepDot: { width: 28, height: 28, borderRadius: "50%", border: "1.5px solid #2a2a2a", background: "#161616", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, color: "#444", transition: "all 0.3s" },
+  stepDot: { width: 28, height: 28, borderRadius: "50%", border: "1.5px solid #2a2a2a", background: "#161616", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, color: "#444" },
   stepActive: { borderColor: "#d4ff3d", color: "#d4ff3d", background: "rgba(212,255,61,0.08)" },
   stepDone: { borderColor: "#d4ff3d", background: "#d4ff3d", color: "#0b0b0b" },
   stepLabel: { fontSize: 10, color: "#444", letterSpacing: "0.05em", textTransform: "uppercase" },
