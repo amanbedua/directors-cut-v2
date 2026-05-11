@@ -23,7 +23,7 @@ jobs:
           git config --global user.email "github-actions@github.com"
           git config --global user.name "github-actions"
 
-          git clone https://Amanbedua:$HF_TOKEN@huggingface.co/spaces/Amanbedua/directors-cut-backend hf-space
+          git clone https://oauth2:$HF_TOKEN@huggingface.co/spaces/Amanbedua/directors-cut-backend hf-space
 
           rsync -av --delete \
             --exclude '.git' \
