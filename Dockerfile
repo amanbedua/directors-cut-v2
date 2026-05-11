@@ -1,12 +1,13 @@
 FROM python:3.11-slim
 
+RUN apt-get update && apt-get install -y ffmpeg
+
 WORKDIR /app
 
-COPY requirements.txt .
+COPY . /app
+
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
-
-EXPOSE 7860
+ENV PORT=7860
 
 CMD ["python", "app.py"]
