@@ -1,5 +1,5 @@
 flask
-gunicorn
-google-generativeai
 flask-cors
-ffmpeg-python
+gunicorn
+requests
+werkzeug
