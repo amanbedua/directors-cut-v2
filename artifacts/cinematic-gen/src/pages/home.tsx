@@ -103,20 +103,22 @@ export default function Home() {
     const t0 = Date.now();
 
     try {
-      // Compress images client-side (keeps payload < 5MB total)
+      // Step 1: Compress images
       setProgressMsg("Compressing images…");
       setProgress(5);
       const compressed = await Promise.all(images.map(f => compressImage(f)));
 
-      setProgress(15);
+      setProgress(12);
       setProgressMsg("Reading audio…");
       let b64Audio: string | null = null;
       if (audioFile) b64Audio = await fileToB64(audioFile);
 
+      // Step 2: Start job (quick response — just returns job_id)
+      setProgress(15);
       const totalKB = Math.round(compressed.reduce((s, b) => s + b.length * 0.75 / 1024, 0));
-      simProgress(18, 82, `Sending ${images.length} scenes (${totalKB} KB) to server…`, 150000);
+      setProgressMsg(`Uploading ${images.length} scenes (${totalKB} KB)…`);
 
-      const resp = await fetch(API_BASE_URL + "/generate-video", {
+      const startResp = await fetch(API_BASE_URL + "/generate-video", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -128,16 +130,44 @@ export default function Home() {
         }),
       });
 
-      if (progTimerRef.current) clearInterval(progTimerRef.current);
-
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({ error: "Server error " + resp.status }));
-        throw new Error(err.error || "Server error " + resp.status);
+      if (!startResp.ok) {
+        const err = await startResp.json().catch(() => ({ error: "Server error " + startResp.status }));
+        throw new Error(err.error || "Server error " + startResp.status);
       }
 
-      setProgressMsg("Downloading video…");
+      const { job_id } = await startResp.json();
+      if (!job_id) throw new Error("No job_id returned from server");
+
+      // Step 3: Poll /status/:job_id until done
+      setProgress(20);
+      setProgressMsg("Rendering cinematic video…");
+
+      await new Promise<void>((resolve, reject) => {
+        const poll = setInterval(async () => {
+          try {
+            const statusResp = await fetch(API_BASE_URL + "/status/" + job_id);
+            if (!statusResp.ok) { clearInterval(poll); reject(new Error("Status check failed")); return; }
+            const s = await statusResp.json();
+            if (s.status === "error") { clearInterval(poll); reject(new Error(s.message || "Render failed")); return; }
+            if (s.status === "done") { clearInterval(poll); resolve(); return; }
+            // Map backend progress (0-100) to frontend range (20-88)
+            const mapped = 20 + Math.round((s.progress / 100) * 68);
+            setProgress(Math.max(mapped, progress));
+            setProgressMsg(s.message || "Rendering…");
+          } catch (pollErr) {
+            // Network hiccup — keep polling
+            console.warn("Poll error:", pollErr);
+          }
+        }, 2000); // poll every 2s
+      });
+
+      // Step 4: Download finished video
       setProgress(92);
-      const blob = await resp.blob();
+      setProgressMsg("Downloading video…");
+      const dlResp = await fetch(API_BASE_URL + "/download/" + job_id);
+      if (!dlResp.ok) throw new Error("Download failed: " + dlResp.status);
+
+      const blob = await dlResp.blob();
       const url = URL.createObjectURL(blob);
       const elapsed = ((Date.now() - t0) / 1000).toFixed(0);
       const sizeMB = (blob.size / 1024 / 1024).toFixed(1);
@@ -148,6 +178,7 @@ export default function Home() {
       setProgress(100);
       setProgressMsg("Done!");
       setStatus("done");
+
     } catch (e: unknown) {
       if (progTimerRef.current) clearInterval(progTimerRef.current);
       const msg = (e as Error).message || "Unknown error";
