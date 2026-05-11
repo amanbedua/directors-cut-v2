@@ -1,866 +1,356 @@
-import React, { useState, useRef, useEffect } from "react";
-import { motion, AnimatePresence } from "framer-motion";
-import {
-  UploadCloud,
-  Image as ImageIcon,
-  Music,
-  Settings2,
-  Play,
-  Download,
-  AlertCircle,
-  CheckCircle2,
-  Loader2,
-  X,
-  Clapperboard,
-  ArrowRight,
-  Wand2,
-  Send,
-  MessageSquare,
-  Zap,
-} from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { useToast } from "@/hooks/use-toast";
-import { Progress } from "@/components/ui/progress";
+import React, { useState, useRef, useCallback } from "react";
 import { API_BASE_URL } from "@/config";
 
-type GenerateStatus =
-  | "idle"
-  | "uploading"
-  | "analyzing"
-  | "plan_ready"
-  | "queued"
-  | "processing"
-  | "done"
-  | "error";
+type Quality = "480p" | "720p" | "1080p";
+type Status = "idle" | "processing" | "done" | "error";
 
-interface AudioState {
-  id: string;
-  path: string;
-  duration: number | null;
+function fileToB64(file: File): Promise<string> {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result as string);
+    r.onerror = rej;
+    r.readAsDataURL(file);
+  });
 }
-
-interface ScenePlan {
-  scene_number: number;
-  duration: number;
-  motion: string;
-  transition: string;
-  intensity: string;
-  direction_note: string;
-}
-
-interface AIPlan {
-  pacing: string;
-  mood: string;
-  zoom_intensity?: string;
-  transition_duration?: number;
-  scenes: ScenePlan[];
-}
-
-interface ChatMessage {
-  role: "user" | "assistant";
-  content: string;
-}
-
-const MOTION_LABELS: Record<string, string> = {
-  slow_push_in: "Slow Push In",
-  slow_pull_back: "Slow Pull Back",
-  drift_left: "Drift Left",
-  drift_right: "Drift Right",
-  dramatic_push: "Dramatic Push",
-  arc_left: "Arc Left",
-  arc_right: "Arc Right",
-  static_breathe: "Static Breathe",
-};
-
-const EXAMPLE_PROMPTS = [
-  "Make pacing emotional",
-  "Add dramatic zooms",
-  "Keep final scene longer",
-  "Add subtle motion",
-  "Smoother transitions",
-  "More dynamic energy",
-  "Melancholic and slow",
-  "Build to a climax",
-];
 
 export default function Home() {
-  const { toast } = useToast();
   const imageInputRef = useRef<HTMLInputElement>(null);
   const audioInputRef = useRef<HTMLInputElement>(null);
-  const chatEndRef = useRef<HTMLDivElement>(null);
 
   const [images, setImages] = useState<File[]>([]);
-  const [sceneNames, setSceneNames] = useState<string[]>([]);
   const [audioFile, setAudioFile] = useState<File | null>(null);
-  const [audio, setAudio] = useState<AudioState | null>(null);
-  const [sessionId, setSessionId] = useState<string | null>(null);
-  const [aiPlan, setAiPlan] = useState<AIPlan | null>(null);
-  const [status, setStatus] = useState<GenerateStatus>("idle");
-  const [jobId, setJobId] = useState<string | null>(null);
+  const [quality, setQuality] = useState<Quality>("480p");
+  const [duration, setDuration] = useState(4);
+  const [prompt, setPrompt] = useState("");
+  const [status, setStatus] = useState<Status>("idle");
   const [progress, setProgress] = useState(0);
-  const [statusMessage, setStatusMessage] = useState("");
-  const [perImageDuration, setPerImageDuration] = useState(5);
-  const [quality, setQuality] = useState<"480p" | "720p" | "1080p">("720p");
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
-  const [chatInput, setChatInput] = useState("");
-  const [isChatting, setIsChatting] = useState(false);
+  const [progressMsg, setProgressMsg] = useState("");
+  const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const [videoBlob, setVideoBlob] = useState<Blob | null>(null);
+  const [errorMsg, setErrorMsg] = useState("");
+  const [isDragOver, setIsDragOver] = useState(false);
+  const [meta, setMeta] = useState<{ scenes: number; size: string; time: string; quality: string } | null>(null);
+  const progTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [backendOk, setBackendOk] = useState<boolean | null>(null);
 
-  useEffect(() => {
-    if (chatEndRef.current) {
-      chatEndRef.current.scrollIntoView({ behavior: "smooth" });
-    }
-  }, [chatMessages]);
+  React.useEffect(() => {
+    fetch(API_BASE_URL + "/health", { signal: AbortSignal.timeout(6000) })
+      .then(r => setBackendOk(r.ok))
+      .catch(() => setBackendOk(false));
+  }, []);
 
-  const handleImageSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || []);
-    if (!files.length) return;
-    setAiPlan(null);
-    setChatMessages([]);
-    setStatus("uploading");
+  const addImages = useCallback((files: File[]) => {
+    const imgs = files.filter(f => f.type.startsWith("image/"));
+    setImages(prev => [...prev, ...imgs].slice(0, 20));
+  }, []);
 
-    const form = new FormData();
-    files.forEach((f) => form.append("images", f));
-    try {
-      const res = await fetch(`${API_BASE_URL}/video-api/upload/images`, {
-        method: "POST",
-        body: form,
-      });
-      if (!res.ok) throw new Error("Image upload failed");
-      const data = await res.json();
-      setSessionId(data.session_id);
-      setImages(files);
-      setSceneNames(data.scene_names || files.map((f) => f.name));
-      setStatus("idle");
-    } catch {
-      setStatus("error");
-      toast({ variant: "destructive", title: "Upload Failed", description: "Could not upload images." });
-    }
+  const removeImage = (i: number) => setImages(prev => prev.filter((_, idx) => idx !== i));
+
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(false);
+    addImages([...e.dataTransfer.files]);
   };
 
-  const handleAudioSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setAudioFile(file);
-    setAiPlan(null);
-    setChatMessages([]);
-
-    const form = new FormData();
-    form.append("audio", file);
-    try {
-      const res = await fetch(`${API_BASE_URL}/video-api/upload/audio`, { method: "POST", body: form });
-      if (!res.ok) throw new Error("Audio upload failed");
-      const data = await res.json();
-      setAudio({ id: data.audio_id, path: data.path, duration: data.duration });
-    } catch {
-      toast({ variant: "destructive", title: "Upload Failed", description: "Could not upload audio." });
-    }
+  const simProgress = (from: number, to: number, msg: string, ms: number) => {
+    if (progTimerRef.current) clearInterval(progTimerRef.current);
+    let cur = from;
+    const step = (to - from) / (ms / 400);
+    setProgressMsg(msg);
+    progTimerRef.current = setInterval(() => {
+      cur = Math.min(cur + step + Math.random() * 0.3, to);
+      setProgress(Math.round(cur));
+      if (cur >= to) {
+        if (progTimerRef.current) clearInterval(progTimerRef.current);
+      }
+    }, 400);
   };
 
-  const removeImage = (idx: number) => {
-    setImages((prev) => prev.filter((_, i) => i !== idx));
-    setSceneNames((prev) => prev.filter((_, i) => i !== idx));
-    setAiPlan(null);
-    setChatMessages([]);
-  };
-
-  const removeAudio = () => {
-    setAudioFile(null);
-    setAudio(null);
-    setAiPlan(null);
-    setChatMessages([]);
-  };
-
-  const handleAnalyze = async () => {
-    if (!sessionId) return;
-    setStatus("analyzing");
-    setAiPlan(null);
-    setChatMessages([]);
-    try {
-      const res = await fetch(`${API_BASE_URL}/video-api/analyze`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          session_id: sessionId,
-          audio_path: audio?.path || null,
-          audio_duration: audio?.duration || null,
-        }),
-      });
-      if (!res.ok) throw new Error("Analysis failed");
-      const data = await res.json();
-      setAiPlan(data.plan);
-      setSceneNames(data.scene_names || sceneNames);
-      setStatus("plan_ready");
-      setChatMessages([
-        {
-          role: "assistant",
-          content: `Direction plan ready — ${data.plan.pacing} pacing, ${data.plan.mood} mood across ${data.plan.scenes.length} scenes. Type any instruction to refine it.`,
-        },
-      ]);
-    } catch {
-      setStatus("error");
-      toast({ variant: "destructive", title: "Analysis Failed", description: "Could not analyze the project." });
-    }
-  };
-
-  useEffect(() => {
-    if (sessionId && audio && audio.duration && !aiPlan && status === "idle") {
-      handleAnalyze();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, audio]);
-
-  const handleChat = async (messageOverride?: string) => {
-    const message = messageOverride || chatInput.trim();
-    if (!message || !aiPlan || isChatting) return;
-    setChatInput("");
-    setChatMessages((prev) => [...prev, { role: "user", content: message }]);
-    setIsChatting(true);
-    try {
-      const res = await fetch(`${API_BASE_URL}/video-api/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message,
-          current_plan: aiPlan,
-          scene_names: sceneNames.filter(Boolean),
-          audio_duration: audio?.duration || null,
-        }),
-      });
-      if (!res.ok) throw new Error("Chat failed");
-      const data = await res.json();
-      setAiPlan(data.plan);
-      setChatMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: data.acknowledgment || "Plan updated." },
-      ]);
-    } catch {
-      setChatMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: "Couldn't process that instruction — try rephrasing." },
-      ]);
-    } finally {
-      setIsChatting(false);
-    }
-  };
-
-  const handleGenerate = async () => {
-    if (!sessionId || images.length === 0) return;
+  const generate = async () => {
+    if (!images.length) return;
     setStatus("processing");
     setProgress(0);
-    setStatusMessage("Initializing render pipeline...");
+    setErrorMsg("");
+    setVideoUrl(null);
+    setMeta(null);
+    const t0 = Date.now();
+
     try {
-      const res = await fetch(`${API_BASE_URL}/video-api/generate`, {
+      setProgressMsg("Reading images…");
+      setProgress(5);
+      const b64Images = await Promise.all(images.map(fileToB64));
+
+      setProgress(18);
+      let b64Audio: string | null = null;
+      if (audioFile) b64Audio = await fileToB64(audioFile);
+
+      simProgress(20, 85, `Rendering ${images.length} scenes on server…`, 120000);
+
+      const resp = await fetch(API_BASE_URL + "/generate-video", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          session_id: sessionId,
-          audio_path: audio?.path || null,
-          audio_duration: audio?.duration || null,
-          per_image_duration: perImageDuration,
-          ai_plan: aiPlan,
+          images: b64Images,
+          audio: b64Audio,
           quality,
+          prompt: prompt.trim(),
+          scene_duration: duration,
         }),
       });
-      if (!res.ok) throw new Error("Generation failed to start");
-      const data = await res.json();
-      setJobId(data.job_id);
-    } catch {
+
+      if (progTimerRef.current) clearInterval(progTimerRef.current);
+
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ error: "Server error " + resp.status }));
+        throw new Error(err.error || "Server error");
+      }
+
+      setProgressMsg("Finalising…");
+      setProgress(92);
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(0);
+      const sizeMB = (blob.size / 1024 / 1024).toFixed(1);
+
+      setVideoBlob(blob);
+      setVideoUrl(url);
+      setMeta({ scenes: images.length, size: sizeMB + " MB", time: elapsed + "s", quality });
+      setProgress(100);
+      setProgressMsg("Done!");
+      setStatus("done");
+    } catch (e: unknown) {
+      if (progTimerRef.current) clearInterval(progTimerRef.current);
+      setErrorMsg((e as Error).message || "Unknown error");
       setStatus("error");
-      toast({ variant: "destructive", title: "Generation Failed", description: "Failed to initialize render." });
     }
   };
 
-  useEffect(() => {
-    let interval: NodeJS.Timeout;
-    if (jobId && (status === "processing" || status === "queued" || (status === "analyzing" && !!jobId))) {
-      interval = setInterval(async () => {
-        try {
-          const res = await fetch(`${API_BASE_URL}/video-api/status/${jobId}`);
-          if (!res.ok) return;
-          const data = await res.json();
-          setProgress(data.progress || 0);
-          setStatusMessage(data.message || "");
-          if (data.status === "done") {
-            setStatus("done");
-            clearInterval(interval);
-          } else if (data.status === "error") {
-            setStatus("error");
-            clearInterval(interval);
-            toast({ variant: "destructive", title: "Render Error", description: data.message || "Unknown error." });
-          } else {
-            setStatus(data.status);
-          }
-        } catch {
-          // ignore transient errors
-        }
-      }, 1500);
-    }
-    return () => { if (interval) clearInterval(interval); };
-  }, [jobId, status, toast]);
+  const download = () => {
+    if (!videoBlob || !videoUrl) return;
+    const a = document.createElement("a");
+    a.href = videoUrl;
+    a.download = "directors_cut_" + Date.now() + ".mp4";
+    a.click();
+  };
 
-  const canAnalyze = images.length > 0 && sessionId && status === "idle";
-  const canRender = images.length > 0 && sessionId && (status === "plan_ready" || (!audio && images.length > 0 && status === "idle"));
-  const isWorking = status === "processing" || status === "queued" || (status === "analyzing" && !!jobId);
-  const isPreAnalyzing = status === "analyzing" && !jobId;
+  const reset = () => {
+    setImages([]);
+    setAudioFile(null);
+    setVideoUrl(null);
+    setVideoBlob(null);
+    setStatus("idle");
+    setProgress(0);
+    setProgressMsg("");
+    setErrorMsg("");
+    setMeta(null);
+    setPrompt("");
+    if (imageInputRef.current) imageInputRef.current.value = "";
+    if (audioInputRef.current) audioInputRef.current.value = "";
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  const isProcessing = status === "processing";
 
   return (
-    <div className="min-h-screen bg-background text-foreground flex flex-col p-4 md:p-8 selection:bg-primary/30">
-      <div className="max-w-6xl w-full mx-auto space-y-6">
+    <div style={S.page}>
+      {/* Header */}
+      <header style={S.header}>
+        <div style={S.brand}>
+          <span style={S.brandName}>Director's Cut</span>
+          <span style={S.brandTag}>AI</span>
+        </div>
+        <div style={S.statusRow}>
+          <span style={{ ...S.dot, background: backendOk === null ? "#555" : backendOk ? "#3dff9a" : "#ff5555", boxShadow: backendOk ? "0 0 6px rgba(61,255,154,0.5)" : "none" }} />
+          <span style={S.statusText}>{backendOk === null ? "Connecting…" : backendOk ? "Backend online" : "Backend offline"}</span>
+        </div>
+      </header>
 
-        {/* Header */}
-        <header className="space-y-1 pt-2">
-          <h1 className="text-3xl font-mono font-bold tracking-tight text-primary flex items-center gap-3">
-            <Clapperboard className="w-7 h-7" />
-            DIRECTOR'S CUT
-          </h1>
-          <p className="text-muted-foreground font-mono text-xs max-w-xl">
-            AI Cinematic Director — Upload sequences & audio. Let Gemini craft the vision. Render.
-          </p>
-        </header>
+      <main style={S.main}>
 
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-
-          {/* Left — Main Workspace */}
-          <div className="lg:col-span-8 space-y-5">
-
-            {/* Sequence Frames */}
-            <Card className="border-border/50 bg-card/50 backdrop-blur">
-              <CardHeader className="pb-3 flex flex-row items-center justify-between">
-                <CardTitle className="font-mono text-xs tracking-widest text-muted-foreground flex items-center gap-2">
-                  <ImageIcon className="w-4 h-4" />
-                  SEQUENCE FRAMES
-                </CardTitle>
-                {images.length > 0 && (
-                  <span className="text-[10px] font-mono text-muted-foreground">
-                    {images.length} LOADED — AUTO-SORTED BY SCENE NUMBER
-                  </span>
-                )}
-              </CardHeader>
-              <CardContent>
-                {images.length === 0 ? (
-                  <div
-                    className="border-2 border-dashed border-border/50 rounded-lg p-8 flex flex-col items-center justify-center text-center cursor-pointer hover:bg-white/5 hover:border-primary/50 transition-colors"
-                    onClick={() => imageInputRef.current?.click()}
-                  >
-                    <UploadCloud className="w-10 h-10 text-muted-foreground mb-3" />
-                    <p className="text-sm font-medium mb-1">Click to upload images</p>
-                    <p className="text-xs text-muted-foreground">JPG, PNG, WEBP</p>
-                    <p className="text-[10px] text-muted-foreground/60 font-mono mt-3">
-                      Name files scene1.png, scene2.png… for automatic ordering
-                    </p>
-                    <input type="file" multiple accept="image/*" className="hidden" ref={imageInputRef} onChange={handleImageSelect} />
-                  </div>
-                ) : (
-                  <div className="space-y-3">
-                    <div className="grid grid-cols-4 sm:grid-cols-7 gap-2">
-                      {images.map((file, i) => (
-                        <div key={i} className="flex flex-col gap-1 group">
-                          <div className="relative aspect-video rounded-md overflow-hidden bg-muted">
-                            <img
-                              src={URL.createObjectURL(file)}
-                              alt={`Scene ${i + 1}`}
-                              className="object-cover w-full h-full opacity-80 group-hover:opacity-100 transition-opacity"
-                            />
-                            <button
-                              className="absolute top-0.5 right-0.5 bg-black/60 p-0.5 rounded-sm opacity-0 group-hover:opacity-100 hover:bg-destructive/80 transition-all"
-                              onClick={(e) => { e.stopPropagation(); removeImage(i); }}
-                            >
-                              <X className="w-2.5 h-2.5 text-white" />
-                            </button>
-                          </div>
-                          {sceneNames[i] && (
-                            <span className="text-[9px] font-mono text-muted-foreground truncate w-full text-center">
-                              {sceneNames[i]}
-                            </span>
-                          )}
-                        </div>
-                      ))}
-                      <div
-                        className="aspect-video rounded-md border-2 border-dashed border-border/30 flex items-center justify-center cursor-pointer hover:border-primary/50 transition-colors"
-                        onClick={() => imageInputRef.current?.click()}
-                      >
-                        <UploadCloud className="w-4 h-4 text-muted-foreground/50" />
-                        <input type="file" multiple accept="image/*" className="hidden" ref={imageInputRef} onChange={handleImageSelect} />
-                      </div>
-                    </div>
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-
-            {/* Master Audio */}
-            <Card className="border-border/50 bg-card/50 backdrop-blur">
-              <CardHeader className="pb-3">
-                <CardTitle className="font-mono text-xs tracking-widest text-muted-foreground flex items-center gap-2">
-                  <Music className="w-4 h-4" />
-                  MASTER AUDIO
-                </CardTitle>
-              </CardHeader>
-              <CardContent>
-                {!audioFile ? (
-                  <div
-                    className="border-2 border-dashed border-border/50 rounded-lg p-5 flex flex-col items-center justify-center text-center cursor-pointer hover:bg-white/5 hover:border-primary/50 transition-colors"
-                    onClick={() => audioInputRef.current?.click()}
-                  >
-                    <UploadCloud className="w-7 h-7 text-muted-foreground mb-2" />
-                    <p className="text-sm font-medium mb-1">Click to upload voiceover or score</p>
-                    <p className="text-xs text-muted-foreground">MP3, WAV, AAC (Optional)</p>
-                    <input type="file" accept="audio/*" className="hidden" ref={audioInputRef} onChange={handleAudioSelect} />
-                  </div>
-                ) : (
-                  <div className="flex items-center justify-between p-3 border border-border/50 rounded-lg bg-black/20">
-                    <div className="flex items-center gap-3">
-                      <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center flex-shrink-0">
-                        <Music className="w-4 h-4 text-primary" />
-                      </div>
-                      <div>
-                        <p className="text-sm font-medium truncate max-w-[200px]">{audioFile.name}</p>
-                        <p className="text-xs text-muted-foreground font-mono">
-                          {audio?.duration ? `${audio.duration.toFixed(1)}s — AI will sync all scenes to this duration` : "Processing..."}
-                        </p>
-                      </div>
-                    </div>
-                    <Button variant="ghost" size="icon" onClick={removeAudio} className="text-muted-foreground hover:text-destructive hover:bg-destructive/10 flex-shrink-0">
-                      <X className="w-4 h-4" />
-                    </Button>
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-
-            {/* AI Pre-analyzing indicator */}
-            <AnimatePresence>
-              {isPreAnalyzing && (
-                <motion.div
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -10 }}
-                  className="flex items-center gap-3 px-4 py-3 rounded-lg border border-primary/30 bg-primary/5"
-                >
-                  <Loader2 className="w-4 h-4 text-primary animate-spin flex-shrink-0" />
-                  <span className="font-mono text-xs text-primary">
-                    GEMINI AI DIRECTOR IS ANALYZING YOUR PROJECT...
-                  </span>
-                </motion.div>
-              )}
-            </AnimatePresence>
-
-            {/* AI Director's Brief */}
-            <AnimatePresence>
-              {aiPlan && !isPreAnalyzing && (
-                <motion.div
-                  initial={{ opacity: 0, y: 20 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0 }}
-                  transition={{ duration: 0.4 }}
-                >
-                  <Card className="border-primary/30 bg-card/80 backdrop-blur shadow-[0_0_20px_rgba(234,179,8,0.06)] overflow-hidden">
-                    <div className="bg-primary/10 border-b border-primary/20 px-5 py-2.5 flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        <Clapperboard className="w-4 h-4 text-primary" />
-                        <span className="font-mono text-xs tracking-widest text-primary font-bold">AI DIRECTOR'S BRIEF</span>
-                      </div>
-                      <div className="flex items-center gap-1.5 font-mono text-[10px]">
-                        <span className="bg-background px-2 py-0.5 rounded-sm border border-border uppercase">{aiPlan.pacing}</span>
-                        <span className="bg-background px-2 py-0.5 rounded-sm border border-border uppercase">{aiPlan.mood}</span>
-                        {aiPlan.zoom_intensity && (
-                          <span className="bg-primary/10 border border-primary/30 text-primary px-2 py-0.5 rounded-sm uppercase">
-                            {aiPlan.zoom_intensity} ZOOM
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                    <CardContent className="p-0">
-                      <div className="divide-y divide-border/30 max-h-80 overflow-y-auto">
-                        {aiPlan.scenes.map((scene, idx) => (
-                          <div key={idx} className="px-4 py-2.5 hover:bg-white/5 transition-colors flex items-center gap-3 group">
-                            <div className="flex-shrink-0 w-7 h-7 rounded-full bg-primary/20 flex items-center justify-center border border-primary/30 text-primary font-mono text-xs font-bold">
-                              {scene.scene_number}
-                            </div>
-                            <div className="flex-1 min-w-0">
-                              <div className="flex items-center gap-2 mb-0.5">
-                                <span className="text-xs font-medium truncate">
-                                  {sceneNames[idx] || `Scene ${scene.scene_number}`}
-                                </span>
-                                <span className="text-[10px] font-mono text-muted-foreground bg-black/30 px-1.5 py-0.5 rounded flex-shrink-0">
-                                  {scene.duration.toFixed(1)}s
-                                </span>
-                              </div>
-                              <p className="text-[10px] text-muted-foreground truncate" title={scene.direction_note}>
-                                {scene.direction_note}
-                              </p>
-                            </div>
-                            <div className="flex items-center gap-2 flex-shrink-0">
-                              <div className="flex flex-col items-end gap-0.5">
-                                <span className="text-[9px] uppercase font-mono bg-primary/10 text-primary px-1.5 py-0.5 rounded-sm border border-primary/20 whitespace-nowrap">
-                                  {MOTION_LABELS[scene.motion] || scene.motion}
-                                </span>
-                                <span className="text-[9px] uppercase font-mono text-muted-foreground">
-                                  {scene.intensity}
-                                </span>
-                              </div>
-                              {idx < aiPlan.scenes.length - 1 && (
-                                <div className="text-muted-foreground/50 group-hover:text-muted-foreground transition-colors flex flex-col items-center">
-                                  <ArrowRight className="w-3 h-3" />
-                                  <span className="text-[8px] font-mono mt-0.5 uppercase">{scene.transition}</span>
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    </CardContent>
-                  </Card>
-                </motion.div>
-              )}
-            </AnimatePresence>
-
-            {/* AI Chat Director */}
-            <AnimatePresence>
-              {aiPlan && !isPreAnalyzing && (
-                <motion.div
-                  initial={{ opacity: 0, y: 20 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0 }}
-                  transition={{ duration: 0.4, delay: 0.1 }}
-                >
-                  <Card className="border-border/60 bg-card/50 backdrop-blur overflow-hidden">
-                    <div className="border-b border-border/40 px-5 py-2.5 flex items-center gap-2">
-                      <MessageSquare className="w-4 h-4 text-muted-foreground" />
-                      <span className="font-mono text-xs tracking-widest text-muted-foreground font-medium">AI CHAT DIRECTOR</span>
-                      <span className="text-[10px] text-muted-foreground/50 font-mono ml-auto">type instructions to refine the cinematic plan</span>
-                    </div>
-                    <CardContent className="p-4 space-y-3">
-                      {/* Example prompts */}
-                      {chatMessages.length <= 1 && (
-                        <div className="flex flex-wrap gap-1.5">
-                          {EXAMPLE_PROMPTS.map((prompt) => (
-                            <button
-                              key={prompt}
-                              onClick={() => handleChat(prompt)}
-                              disabled={isChatting}
-                              className="text-[10px] font-mono px-2.5 py-1 rounded-full border border-border/60 text-muted-foreground hover:border-primary/50 hover:text-primary hover:bg-primary/5 transition-all disabled:opacity-40"
-                            >
-                              {prompt}
-                            </button>
-                          ))}
-                        </div>
-                      )}
-
-                      {/* Chat history */}
-                      {chatMessages.length > 0 && (
-                        <div className="space-y-2 max-h-48 overflow-y-auto">
-                          {chatMessages.map((msg, i) => (
-                            <div
-                              key={i}
-                              className={`flex gap-2 ${msg.role === "user" ? "justify-end" : "justify-start"}`}
-                            >
-                              <div
-                                className={`max-w-[85%] px-3 py-2 rounded-lg text-xs font-mono ${
-                                  msg.role === "user"
-                                    ? "bg-primary/20 text-primary border border-primary/30 ml-8"
-                                    : "bg-muted/50 text-muted-foreground border border-border/40 mr-8"
-                                }`}
-                              >
-                                {msg.content}
-                              </div>
-                            </div>
-                          ))}
-                          {isChatting && (
-                            <div className="flex gap-2 justify-start">
-                              <div className="px-3 py-2 rounded-lg text-xs font-mono bg-muted/50 border border-border/40">
-                                <Loader2 className="w-3 h-3 animate-spin text-muted-foreground" />
-                              </div>
-                            </div>
-                          )}
-                          <div ref={chatEndRef} />
-                        </div>
-                      )}
-
-                      {/* Chat input */}
-                      <div className="flex gap-2">
-                        <Input
-                          value={chatInput}
-                          onChange={(e: React.ChangeEvent<HTMLInputElement>) => setChatInput(e.target.value)}
-                          onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => {
-                            if (e.key === "Enter" && !e.shiftKey) {
-                              e.preventDefault();
-                              handleChat();
-                            }
-                          }}
-                          placeholder="e.g. make pacing emotional, add dramatic zooms, keep final scene longer..."
-                          className="bg-black/20 border-border/50 font-mono text-xs h-9 flex-1"
-                          disabled={isChatting}
-                        />
-                        <Button
-                          onClick={() => handleChat()}
-                          disabled={isChatting || !chatInput.trim()}
-                          size="icon"
-                          className="h-9 w-9 flex-shrink-0 bg-primary hover:bg-primary/90"
-                        >
-                          {isChatting ? (
-                            <Loader2 className="w-4 h-4 animate-spin" />
-                          ) : (
-                            <Send className="w-4 h-4" />
-                          )}
-                        </Button>
-                      </div>
-                    </CardContent>
-                  </Card>
-                </motion.div>
-              )}
-            </AnimatePresence>
-
+        {/* Images */}
+        <div style={S.card}>
+          <div style={S.cardLabel}>Scenes — Images</div>
+          <div
+            style={{ ...S.uploadZone, ...(isDragOver ? S.uploadZoneHover : {}) }}
+            onDragOver={e => { e.preventDefault(); setIsDragOver(true); }}
+            onDragLeave={() => setIsDragOver(false)}
+            onDrop={onDrop}
+            onClick={() => imageInputRef.current?.click()}
+          >
+            <input ref={imageInputRef} type="file" accept="image/*" multiple style={S.hiddenInput}
+              onChange={e => { addImages([...(e.target.files || [])]); e.target.value = ""; }} />
+            <div style={S.uploadIcon}>⬆</div>
+            <div style={S.uploadTitle}>Drop images here or tap to upload</div>
+            <div style={S.uploadSub}>JPG, PNG, WEBP · Max 20 images</div>
           </div>
-
-          {/* Right Sidebar */}
-          <div className="lg:col-span-4 space-y-5">
-
-            {/* Minimal settings — only show when no audio */}
-            {!audio && (
-              <Card className="border-border/50 bg-card/50 backdrop-blur">
-                <CardHeader className="pb-3">
-                  <CardTitle className="font-mono text-xs tracking-widest text-muted-foreground flex items-center gap-2">
-                    <Settings2 className="w-4 h-4" />
-                    HOLD PER FRAME
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-2">
-                  <p className="text-[10px] text-muted-foreground font-mono">
-                    Duration per scene when no audio is uploaded. AI uses this as baseline.
-                  </p>
-                  <div className="flex items-center gap-3">
-                    <input
-                      type="number"
-                      min={2}
-                      max={12}
-                      step={0.5}
-                      value={perImageDuration}
-                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setPerImageDuration(Number(e.target.value))}
-                      className="flex h-9 w-full rounded-md border border-input bg-black/20 px-3 py-1 text-sm font-mono ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                    />
-                    <span className="text-xs font-mono text-muted-foreground whitespace-nowrap">SEC</span>
-                  </div>
-                </CardContent>
-              </Card>
-            )}
-
-            {/* AI system status */}
-            {audio && !aiPlan && !isPreAnalyzing && (
-              <Card className="border-border/40 bg-card/30">
-                <CardContent className="p-4 flex items-start gap-3">
-                  <Zap className="w-4 h-4 text-primary mt-0.5 flex-shrink-0" />
-                  <div className="space-y-1">
-                    <p className="text-xs font-mono text-primary font-medium">AI MODE ACTIVE</p>
-                    <p className="text-[10px] text-muted-foreground font-mono leading-relaxed">
-                      Gemini AI will automatically handle pacing, motion, transitions, and audio sync. No manual settings needed.
-                    </p>
-                  </div>
-                </CardContent>
-              </Card>
-            )}
-
-            {/* Quality selector — always visible */}
-            <Card className="border-border/50 bg-card/50 backdrop-blur">
-              <CardHeader className="pb-3">
-                <CardTitle className="font-mono text-xs tracking-widest text-muted-foreground flex items-center gap-2">
-                  <Settings2 className="w-4 h-4" />
-                  OUTPUT QUALITY
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-3">
-                <p className="text-[10px] text-muted-foreground font-mono">
-                  Lower quality = less RAM = more stable on free servers.
-                </p>
-                <div className="grid grid-cols-3 gap-2">
-                  {(["480p", "720p", "1080p"] as const).map((q) => (
-                    <button
-                      key={q}
-                      onClick={() => setQuality(q)}
-                      className={[
-                        "h-10 rounded-md border font-mono text-xs tracking-widest transition-all",
-                        quality === q
-                          ? "border-primary bg-primary/10 text-primary font-bold"
-                          : "border-border/50 bg-black/20 text-muted-foreground hover:border-border hover:text-foreground",
-                      ].join(" ")}
-                    >
-                      {q}
-                      {q === "720p" && (
-                        <span className="block text-[8px] opacity-60 mt-0.5">recommended</span>
-                      )}
-                      {q === "480p" && (
-                        <span className="block text-[8px] opacity-60 mt-0.5">fastest</span>
-                      )}
-                      {q === "1080p" && (
-                        <span className="block text-[8px] opacity-60 mt-0.5">high quality</span>
-                      )}
-                    </button>
-                  ))}
+          {images.length > 0 && (
+            <div style={S.imgGrid}>
+              {images.map((f, i) => (
+                <div key={i} style={S.thumb}>
+                  <img src={URL.createObjectURL(f)} alt="" style={S.thumbImg} />
+                  <span style={S.sceneNum}>{i + 1}</span>
+                  <button style={S.delBtn} onClick={e => { e.stopPropagation(); removeImage(i); }}>×</button>
                 </div>
-              </CardContent>
-            </Card>
+              ))}
+            </div>
+          )}
+        </div>
 
-            {/* Analyze button — when images loaded but no plan yet */}
-            {canAnalyze && !audio && !aiPlan && (
-              <Button
-                onClick={handleAnalyze}
-                disabled={isPreAnalyzing}
-                className="w-full h-12 font-mono text-sm tracking-widest bg-secondary hover:bg-secondary/80 text-secondary-foreground border border-border/50"
-              >
-                {isPreAnalyzing ? (
-                  <>
-                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                    ANALYZING...
-                  </>
-                ) : (
-                  <>
-                    <Wand2 className="w-4 h-4 mr-2" />
-                    GENERATE PLAN
-                  </>
-                )}
-              </Button>
-            )}
-
-            {/* Main action button */}
-            <Button
-              onClick={aiPlan ? handleGenerate : canAnalyze ? handleAnalyze : handleGenerate}
-              disabled={
-                images.length === 0 ||
-                !sessionId ||
-                isWorking ||
-                isPreAnalyzing ||
-                status === "done"
+        {/* Audio */}
+        <div style={S.card}>
+          <div style={S.cardLabel}>Soundtrack — Audio</div>
+          <div style={S.audioRow} onClick={() => !audioFile && audioInputRef.current?.click()}>
+            <input ref={audioInputRef} type="file" accept="audio/*" style={S.hiddenInput}
+              onChange={e => setAudioFile(e.target.files?.[0] || null)} />
+            <span style={{ fontSize: 22, color: audioFile ? "#d4ff3d" : "#555" }}>♪</span>
+            <div style={{ flex: 1 }}>
+              {audioFile
+                ? <span style={S.audioName}>{audioFile.name}</span>
+                : <><div style={{ fontSize: 13, fontWeight: 500, color: "#888" }}>Add background music</div><div style={{ fontSize: 11, color: "#555" }}>MP3, WAV, M4A (optional)</div></>
               }
-              className="w-full h-14 font-mono text-base tracking-widest bg-primary hover:bg-primary/90 text-primary-foreground transition-all shadow-[0_0_20px_rgba(234,179,8,0.15)] hover:shadow-[0_0_35px_rgba(234,179,8,0.3)] disabled:opacity-50 disabled:shadow-none relative overflow-hidden group"
-            >
-              {isWorking ? (
-                <>
-                  <Loader2 className="w-5 h-5 mr-2 animate-spin" />
-                  RENDERING...
-                </>
-              ) : isPreAnalyzing ? (
-                <>
-                  <Wand2 className="w-5 h-5 mr-2 animate-pulse" />
-                  ANALYZING...
-                </>
-              ) : aiPlan ? (
-                <>
-                  <Play className="w-5 h-5 mr-2 fill-current" />
-                  EXECUTE RENDER
-                </>
-              ) : (
-                <>
-                  <Wand2 className="w-5 h-5 mr-2" />
-                  {audio ? "AI DIRECTING..." : "GENERATE PLAN"}
-                </>
-              )}
-              <div className="absolute inset-0 -translate-x-full bg-gradient-to-r from-transparent via-white/15 to-transparent group-hover:animate-[shimmer_2s_infinite]" />
-            </Button>
-
-            {/* Plan summary card when ready */}
-            {aiPlan && status === "plan_ready" && (
-              <motion.div initial={{ opacity: 0, scale: 0.97 }} animate={{ opacity: 1, scale: 1 }}>
-                <Card className="border-primary/20 bg-primary/5">
-                  <CardContent className="p-4 space-y-2">
-                    <p className="text-[10px] font-mono text-primary uppercase tracking-widest font-bold">Plan Ready</p>
-                    <div className="grid grid-cols-2 gap-2 text-[10px] font-mono">
-                      <div className="space-y-1">
-                        <p className="text-muted-foreground">SCENES</p>
-                        <p className="text-foreground font-bold">{aiPlan.scenes.length}</p>
-                      </div>
-                      <div className="space-y-1">
-                        <p className="text-muted-foreground">TOTAL DURATION</p>
-                        <p className="text-foreground font-bold">
-                          {audio?.duration ? `${audio.duration.toFixed(0)}s` : `~${(aiPlan.scenes.reduce((a, s) => a + s.duration, 0)).toFixed(0)}s`}
-                        </p>
-                      </div>
-                      <div className="space-y-1">
-                        <p className="text-muted-foreground">PACING</p>
-                        <p className="text-foreground font-bold uppercase">{aiPlan.pacing}</p>
-                      </div>
-                      <div className="space-y-1">
-                        <p className="text-muted-foreground">ZOOM</p>
-                        <p className="text-foreground font-bold uppercase">{aiPlan.zoom_intensity || "medium"}</p>
-                      </div>
-                    </div>
-                  </CardContent>
-                </Card>
-              </motion.div>
+            </div>
+            {audioFile && (
+              <button style={S.clearBtn} onClick={e => { e.stopPropagation(); setAudioFile(null); if (audioInputRef.current) audioInputRef.current.value = ""; }}>×</button>
             )}
-
-            {/* Render progress */}
-            <AnimatePresence mode="wait">
-              {isWorking && (
-                <motion.div
-                  initial={{ opacity: 0, height: 0 }}
-                  animate={{ opacity: 1, height: "auto" }}
-                  exit={{ opacity: 0, height: 0 }}
-                  className="bg-black/40 border border-primary/20 rounded-lg p-4 space-y-3"
-                >
-                  <div className="flex justify-between items-center text-xs font-mono">
-                    <span className="text-primary/80 uppercase tracking-wider font-bold animate-pulse text-[10px]">
-                      {statusMessage || "INITIALIZING..."}
-                    </span>
-                    <span className="text-primary font-bold">{Math.round(progress)}%</span>
-                  </div>
-                  <Progress value={progress} className="h-1.5 bg-primary/10" />
-                  <p className="text-[9px] font-mono text-muted-foreground/60">
-                    FFmpeg cinematic render in progress — {images.length} scenes
-                  </p>
-                </motion.div>
-              )}
-
-              {status === "done" && jobId && (
-                <motion.div
-                  initial={{ opacity: 0, scale: 0.95 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  className="bg-primary/10 border border-primary/30 rounded-lg p-5 flex flex-col items-center text-center space-y-3"
-                >
-                  <CheckCircle2 className="w-10 h-10 text-primary" />
-                  <div>
-                    <h3 className="font-mono text-base text-primary font-bold">RENDER COMPLETE</h3>
-                    <p className="text-[10px] text-muted-foreground font-mono mt-1">JOB: {jobId.substring(0, 8)}</p>
-                  </div>
-                  <Button asChild className="w-full font-mono" variant="secondary">
-                    <a href={`${API_BASE_URL}/video-api/download/${jobId}`} download>
-                      <Download className="w-4 h-4 mr-2" />
-                      DOWNLOAD MASTER
-                    </a>
-                  </Button>
-                  <button
-                    onClick={() => {
-                      setStatus("idle");
-                      setJobId(null);
-                      setProgress(0);
-                    }}
-                    className="text-[10px] font-mono text-muted-foreground hover:text-foreground transition-colors"
-                  >
-                    Start new render
-                  </button>
-                </motion.div>
-              )}
-
-              {status === "error" && (
-                <motion.div
-                  initial={{ opacity: 0, scale: 0.95 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  className="bg-destructive/10 border border-destructive/30 rounded-lg p-5 flex flex-col items-center text-center space-y-2"
-                >
-                  <AlertCircle className="w-8 h-8 text-destructive" />
-                  <h3 className="font-mono text-sm text-destructive font-bold">RENDER FAILED</h3>
-                  <p className="text-xs text-muted-foreground text-center">{statusMessage}</p>
-                  <Button variant="outline" size="sm" className="mt-2 font-mono w-full" onClick={() => setStatus(aiPlan ? "plan_ready" : "idle")}>
-                    ACKNOWLEDGE
-                  </Button>
-                </motion.div>
-              )}
-            </AnimatePresence>
-
+            {!audioFile && <span style={{ color: "#555", fontSize: 13 }}>Browse →</span>}
           </div>
         </div>
-      </div>
+
+        {/* Settings */}
+        <div style={S.card}>
+          <div style={S.cardLabel}>Settings</div>
+          <div style={S.settingsGrid}>
+            <div>
+              <div style={S.settingLabel}>Quality</div>
+              <select value={quality} onChange={e => setQuality(e.target.value as Quality)} style={S.select}>
+                <option value="480p">480p — Fast</option>
+                <option value="720p">720p — HD</option>
+                <option value="1080p">1080p — Full HD</option>
+              </select>
+            </div>
+            <div>
+              <div style={S.settingLabel}>Scene Duration: <span style={{ color: "#d4ff3d" }}>{duration}s</span></div>
+              <input type="range" min={2} max={10} step={1} value={duration}
+                onChange={e => setDuration(+e.target.value)}
+                style={{ width: "100%", accentColor: "#d4ff3d", marginTop: 10 }} />
+            </div>
+          </div>
+          <div style={{ marginTop: 14 }}>
+            <div style={S.settingLabel}>AI Director Prompt (optional)</div>
+            <textarea value={prompt} onChange={e => setPrompt(e.target.value)}
+              placeholder="e.g. cinematic thriller with fast cuts, emotional wedding moments…"
+              style={S.textarea} />
+          </div>
+        </div>
+
+        {/* Error */}
+        {status === "error" && (
+          <div style={S.errorBox}>⚠ {errorMsg}</div>
+        )}
+
+        {/* Generate button */}
+        <button
+          style={{ ...S.btnGenerate, opacity: (!images.length || isProcessing) ? 0.35 : 1, cursor: (!images.length || isProcessing) ? "not-allowed" : "pointer" }}
+          disabled={!images.length || isProcessing}
+          onClick={generate}
+        >
+          {isProcessing ? "Generating…" : images.length ? `Generate Video — ${images.length} scene${images.length > 1 ? "s" : ""}` : "Select images to generate video"}
+        </button>
+
+        {/* Progress */}
+        {isProcessing && (
+          <div style={S.card}>
+            <div style={S.stepsRow}>
+              {["Upload", "Render", "Merge", "Done"].map((label, i) => {
+                const stepPct = [0, 20, 85, 100];
+                const done = progress >= stepPct[i + 1] || (i === 3 && progress === 100);
+                const active = progress >= stepPct[i] && !done;
+                return (
+                  <div key={i} style={S.step}>
+                    <div style={{ ...S.stepDot, ...(done ? S.stepDone : active ? S.stepActive : {}) }}>
+                      {done ? "✓" : i + 1}
+                    </div>
+                    <div style={{ ...S.stepLabel, ...(done ? { color: "#d4ff3d" } : active ? { color: "#aaa" } : {}) }}>{label}</div>
+                  </div>
+                );
+              })}
+            </div>
+            <div style={S.progressWrap}>
+              <div style={{ ...S.progressFill, width: progress + "%" }} />
+            </div>
+            <div style={S.progressText}>{progressMsg}</div>
+          </div>
+        )}
+
+        {/* Result */}
+        {status === "done" && videoUrl && (
+          <div style={S.card}>
+            <div style={S.cardLabel}>Preview</div>
+            {meta && (
+              <div style={S.metaRow}>
+                {[meta.quality, meta.scenes + " scenes", meta.size, meta.time].map(m => (
+                  <span key={m} style={S.metaPill}>{m}</span>
+                ))}
+              </div>
+            )}
+            <video src={videoUrl} controls playsInline style={S.video} />
+            <div style={S.resultActions}>
+              <button style={S.btnDl} onClick={download}>⬇ Download Video</button>
+              <button style={S.btnNew} onClick={reset}>New Video</button>
+            </div>
+          </div>
+        )}
+
+      </main>
     </div>
   );
 }
+
+const S: Record<string, React.CSSProperties> = {
+  page: { background: "#0b0b0b", color: "#f0f0f0", minHeight: "100vh", fontFamily: "'DM Sans', 'Inter', sans-serif" },
+  header: { padding: "24px 20px 18px", borderBottom: "1px solid #1e1e1e", display: "flex", alignItems: "center", justifyContent: "space-between" },
+  brand: { display: "flex", alignItems: "baseline", gap: 10 },
+  brandName: { fontFamily: "Georgia, serif", fontSize: 22, fontWeight: 600, letterSpacing: "0.02em" },
+  brandTag: { fontSize: 11, fontWeight: 500, letterSpacing: "0.12em", textTransform: "uppercase", color: "#d4ff3d", background: "rgba(212,255,61,0.1)", padding: "3px 8px", borderRadius: 4 },
+  statusRow: { display: "flex", alignItems: "center", gap: 6 },
+  dot: { width: 7, height: 7, borderRadius: "50%", display: "inline-block", flexShrink: 0 },
+  statusText: { fontSize: 12, color: "#555" },
+  main: { maxWidth: 560, margin: "0 auto", padding: "24px 16px 80px", display: "flex", flexDirection: "column", gap: 16 },
+  card: { background: "#161616", border: "1px solid #222", borderRadius: 12, padding: 20 },
+  cardLabel: { fontSize: 11, fontWeight: 500, letterSpacing: "0.1em", textTransform: "uppercase", color: "#444", marginBottom: 14 },
+  uploadZone: { border: "1.5px dashed #2a2a2a", borderRadius: 8, padding: "28px 20px", textAlign: "center", cursor: "pointer", transition: "all 0.2s", position: "relative" },
+  uploadZoneHover: { borderColor: "#d4ff3d", background: "rgba(212,255,61,0.05)" },
+  hiddenInput: { position: "absolute", inset: 0, opacity: 0, cursor: "pointer", width: "100%", height: "100%" },
+  uploadIcon: { fontSize: 26, color: "#444", marginBottom: 8 },
+  uploadTitle: { fontSize: 14, fontWeight: 500, color: "#666", marginBottom: 4 },
+  uploadSub: { fontSize: 12, color: "#444" },
+  imgGrid: { display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, marginTop: 14 },
+  thumb: { position: "relative", aspectRatio: "1", borderRadius: 8, overflow: "hidden", background: "#1e1e1e", border: "1px solid #2a2a2a" },
+  thumbImg: { width: "100%", height: "100%", objectFit: "cover", display: "block" },
+  sceneNum: { position: "absolute", top: 5, left: 5, background: "rgba(0,0,0,0.75)", color: "#d4ff3d", fontSize: 10, fontWeight: 500, padding: "2px 6px", borderRadius: 4 },
+  delBtn: { position: "absolute", top: 5, right: 5, width: 22, height: 22, borderRadius: "50%", background: "rgba(0,0,0,0.8)", border: "none", color: "#fff", fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", lineHeight: 1 },
+  audioRow: { display: "flex", alignItems: "center", gap: 12, padding: "14px 16px", border: "1.5px dashed #2a2a2a", borderRadius: 8, cursor: "pointer", position: "relative" },
+  audioName: { fontSize: 13, fontWeight: 500, color: "#f0f0f0", maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "block" },
+  clearBtn: { background: "none", border: "none", color: "#555", fontSize: 20, cursor: "pointer", padding: 4, lineHeight: 1, flexShrink: 0 },
+  settingsGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 },
+  settingLabel: { fontSize: 11, color: "#555", letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 8 },
+  select: { width: "100%", background: "#1e1e1e", border: "1px solid #2a2a2a", borderRadius: 8, color: "#f0f0f0", fontFamily: "inherit", fontSize: 14, padding: "10px 12px", outline: "none" },
+  textarea: { width: "100%", background: "#1e1e1e", border: "1px solid #2a2a2a", borderRadius: 8, color: "#f0f0f0", fontFamily: "inherit", fontSize: 14, padding: "10px 12px", outline: "none", resize: "none", height: 68, lineHeight: 1.5, boxSizing: "border-box" },
+  errorBox: { background: "rgba(255,85,85,0.08)", border: "1px solid rgba(255,85,85,0.25)", borderRadius: 8, padding: "14px 16px", fontSize: 13, color: "#ff9090" },
+  btnGenerate: { width: "100%", padding: 16, background: "#d4ff3d", color: "#0b0b0b", border: "none", borderRadius: 12, fontFamily: "inherit", fontSize: 15, fontWeight: 500, cursor: "pointer", transition: "opacity 0.2s" },
+  stepsRow: { display: "flex", justifyContent: "space-between", marginBottom: 20 },
+  step: { display: "flex", flexDirection: "column", alignItems: "center", flex: 1, gap: 6 },
+  stepDot: { width: 28, height: 28, borderRadius: "50%", border: "1.5px solid #2a2a2a", background: "#161616", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, color: "#444", transition: "all 0.3s" },
+  stepActive: { borderColor: "#d4ff3d", color: "#d4ff3d", background: "rgba(212,255,61,0.08)" },
+  stepDone: { borderColor: "#d4ff3d", background: "#d4ff3d", color: "#0b0b0b" },
+  stepLabel: { fontSize: 10, color: "#444", letterSpacing: "0.05em", textTransform: "uppercase" },
+  progressWrap: { background: "#1e1e1e", borderRadius: 99, height: 4, overflow: "hidden", marginBottom: 10 },
+  progressFill: { height: "100%", background: "#d4ff3d", borderRadius: 99, transition: "width 0.5s ease" },
+  progressText: { fontSize: 13, color: "#666", textAlign: "center" },
+  metaRow: { display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 },
+  metaPill: { fontSize: 11, color: "#555", background: "#1e1e1e", border: "1px solid #2a2a2a", borderRadius: 99, padding: "4px 10px" },
+  video: { width: "100%", borderRadius: 8, background: "#000", display: "block", marginBottom: 14, maxHeight: 320, objectFit: "contain" },
+  resultActions: { display: "flex", gap: 10 },
+  btnDl: { flex: 1, padding: 13, background: "#d4ff3d", color: "#0b0b0b", border: "none", borderRadius: 8, fontFamily: "inherit", fontSize: 14, fontWeight: 500, cursor: "pointer" },
+  btnNew: { padding: "13px 18px", background: "none", color: "#888", border: "1px solid #2a2a2a", borderRadius: 8, fontFamily: "inherit", fontSize: 14, cursor: "pointer", whiteSpace: "nowrap" },
+};
