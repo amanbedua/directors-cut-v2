@@ -10,4 +10,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 ENV PORT=7860
 
-CMD ["python", "app.py"]
+CMD ["gunicorn", "-b", "0.0.0.0:7860", "app:app"]
