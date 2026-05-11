@@ -1,0 +1,38 @@
+name: Sync to Hugging Face
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install rsync
+        run: sudo apt-get update && sudo apt-get install -y rsync
+
+      - name: Push to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git config --global user.email "github-actions@github.com"
+          git config --global user.name "github-actions"
+
+          git clone https://Amanbedua:$HF_TOKEN@huggingface.co/spaces/Amanbedua/directors-cut-backend hf-space
+
+          rsync -av --delete \
+            --exclude '.git' \
+            --exclude 'node_modules' \
+            ./ hf-space/
+
+          cd hf-space
+
+          git add .
+          git commit -m "Auto sync from GitHub" || echo "No changes to commit"
+
+          git push
