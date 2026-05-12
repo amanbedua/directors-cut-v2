@@ -14,11 +14,7 @@ backend/__pycache__/
 # OS
 .DS_Store
 
-# Replit (not needed)
-.replit
-.replitignore
-.npmrc
-artifacts/
-components/
-lib/
-scripts/
+# Old Replit folders (root level only)
+/artifacts/
+/lib/
+/scripts/
