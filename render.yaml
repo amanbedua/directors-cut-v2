@@ -2,12 +2,9 @@ services:
   - type: web
     name: directors-cut-frontend
     env: static
-    buildCommand: cd artifacts/cinematic-gen && npm install --legacy-peer-deps && npm run build
-    staticPublishPath: artifacts/cinematic-gen/dist/public
+    buildCommand: npm install && npm run build
+    rootDir: frontend
+    staticPublishPath: dist
     envVars:
       - key: VITE_API_BASE_URL
         value: https://amanbedua-directors-cut-backend.hf.space
-    headers:
-      - path: /*
-        name: Cache-Control
-        value: no-cache
