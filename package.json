@@ -1,8 +1,0 @@
-{
-  "name": "directors-cut-v2",
-  "private": true,
-  "scripts": {
-    "dev:frontend": "cd frontend && npm install && npm run dev",
-    "dev:backend": "cd backend && python app.py"
-  }
-}
