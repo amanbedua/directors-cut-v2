@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: directors-cut-v2
+    runtime: static
+    buildCommand: bash build.sh
+    staticPublishPath: frontend/dist
+    pullRequestPreviewsEnabled: false
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
