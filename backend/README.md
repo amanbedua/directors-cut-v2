@@ -1,9 +1,12 @@
 ---
-title: Directors Cut Backend
-emoji: 🎬
+title: "Directors Cut Backend"
+emoji: "🎬"
 colorFrom: amber
 colorTo: indigo
 sdk: docker
+sdk_version: "1.0.0"
+python_version: "3.11"
+app_file: app.py
 app_port: 7860
 pinned: false
 ---
