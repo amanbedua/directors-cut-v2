@@ -1,7 +1,7 @@
 ---
 title: "Directors Cut Backend"
 emoji: "🎬"
-colorFrom: amber
+colorFrom: yellow
 colorTo: indigo
 sdk: docker
 sdk_version: "1.0.0"
