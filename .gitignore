@@ -20,3 +20,6 @@ backend/__pycache__/
 /scripts/
 
 .npmrc
+
+# Root build output
+dist/

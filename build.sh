@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
-cd frontend
-npm install --no-package-lock
-npx vite build
+set -euo pipefail
+
+npm install
+npm run build

@@ -1,9 +1,12 @@
-name: Sync to Hugging Face
+name: Sync backend to Hugging Face
 
 on:
   push:
     branches:
       - main
+    paths:
+      - "backend/**"
+      - ".github/workflows/hf-sync.yml"
 
 jobs:
   sync:
@@ -16,16 +19,17 @@ jobs:
           fetch-depth: 0
           lfs: false
 
-      - name: Prepare clean sync folder
+      - name: Prepare backend-only sync folder
         run: |
           mkdir hf-sync
-          rsync -av ./ hf-sync/ \
-            --exclude '.git' \
+          rsync -av backend/ hf-sync/ \
+            --exclude '__pycache__' \
+            --exclude '*.pyc' \
             --exclude 'artifacts' \
             --exclude '*.mp4' \
             --exclude 'outputs'
 
-      - name: Push to Hugging Face
+      - name: Push backend to Hugging Face
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
@@ -39,6 +43,6 @@ jobs:
           git remote add origin https://oauth2:$HF_TOKEN@huggingface.co/spaces/Amanbedua/directors-cut-backend
 
           git add .
-          git commit -m "Sync from GitHub" || echo "No changes"
+          git commit -m "Sync backend from GitHub" || echo "No changes"
 
           git push --force origin main

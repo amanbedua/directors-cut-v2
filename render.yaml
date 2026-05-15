@@ -3,7 +3,7 @@ services:
     name: directors-cut-v2
     runtime: static
     buildCommand: bash build.sh
-    staticPublishPath: frontend/dist
+    staticPublishPath: dist
     pullRequestPreviewsEnabled: false
     routes:
       - type: rewrite
