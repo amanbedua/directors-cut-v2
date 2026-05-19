@@ -27,11 +27,12 @@ GEMINI_URL     = (f"https://generativelanguage.googleapis.com/v1beta"
                   f"/models/{GEMINI_MODEL}:generateContent")
 
 QUALITY_PROFILES = {
-    "480p":  {"W": 854,  "H": 480,  "crf": 28, "preset": "ultrafast", "lookahead": 10},
-    "720p":  {"W": 1280, "H": 720,  "crf": 25, "preset": "faster",    "lookahead": 20},
-    "1080p": {"W": 1920, "H": 1080, "crf": 22, "preset": "medium",    "lookahead": 20},
+    "480p":  {"W": 854,  "H": 480,  "crf": 24, "preset": "veryfast", "lookahead": 20, "maxrate": "1800k", "bufsize": "3600k"},
+    "720p":  {"W": 1280, "H": 720,  "crf": 20, "preset": "medium",   "lookahead": 30, "maxrate": "4200k", "bufsize": "8400k"},
+    "1080p": {"W": 1920, "H": 1080, "crf": 18, "preset": "medium",   "lookahead": 35, "maxrate": "8000k", "bufsize": "16000k"},
 }
 DEFAULT_QUALITY  = "480p"
+QUALITY_FALLBACKS = {"1080p": ["1080p", "720p", "480p"], "720p": ["720p", "480p"], "480p": ["480p"]}
 MOTION_STYLES    = ["slow_push_in","slow_pull_back","drift_left","drift_right",
                     "dramatic_push","arc_left","arc_right","static_breathe"]
 TRANSITION_TYPES = ["fade","dissolve","wipeleft","wiperight","circleopen"]
@@ -40,11 +41,19 @@ ZOOM_INTENSITIES = ["low","medium","high"]
 
 import requests as http_requests
 
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+
+
+def _resolve_allow_origin(req_origin: str | None) -> str:
+    if not ALLOWED_ORIGINS:
+        return "*"
+    if req_origin and req_origin in ALLOWED_ORIGINS:
+        return req_origin
+    return ALLOWED_ORIGINS[0]
 
 # ═══ CORS — manual, no flask_cors ════════════════════════════════════════════
 
 CORS_HEADERS = {
-    "Access-Control-Allow-Origin":  "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Max-Age":       "86400",
@@ -52,6 +61,9 @@ CORS_HEADERS = {
 
 @app.after_request
 def apply_cors(response):
+    origin = _resolve_allow_origin(request.headers.get("Origin"))
+    response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Vary"] = "Origin"
     for k, v in CORS_HEADERS.items():
         response.headers[k] = v
     return response
@@ -60,6 +72,9 @@ def apply_cors(response):
 def handle_options():
     if request.method == "OPTIONS":
         r = make_response("", 204)
+        origin = _resolve_allow_origin(request.headers.get("Origin"))
+        r.headers["Access-Control-Allow-Origin"] = origin
+        r.headers["Vary"] = "Origin"
         for k, v in CORS_HEADERS.items():
             r.headers[k] = v
         return r
@@ -228,7 +243,9 @@ def merge_clips_xfade(clip_paths, hold_times, scene_transitions, transition_dura
            + ["-filter_complex",";".join(parts),"-map","[vout]",
               "-c:v","libx264","-pix_fmt","yuv420p",
               "-preset",prof["preset"],"-crf",str(prof["crf"]),
-              "-x264-params",f"rc-lookahead={prof['lookahead']}:ref=1:threads=2",
+              "-maxrate",prof["maxrate"],"-bufsize",prof["bufsize"],
+              "-profile:v","high",
+              "-x264-params",f"rc-lookahead={prof['lookahead']}:ref=3:threads=2",
               "-movflags","+faststart", output_path])
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try: _, se = proc.communicate(timeout=900)
@@ -239,7 +256,7 @@ def merge_clips_xfade(clip_paths, hold_times, scene_transitions, transition_dura
 
 # ═══ CORE BUILD ═══════════════════════════════════════════════════════════════
 
-def build_video(job_id, job_dir, image_paths, audio_path, quality, prompt, scene_duration, output_path):
+def _build_video_once(job_id, job_dir, image_paths, audio_path, quality, prompt, scene_duration, output_path):
     def upd(p, m, st="processing"):
         jobs[job_id].update({"progress":p,"message":m,"status":st})
         print(f"[{job_id[:8]}] {p}% — {m}")
@@ -280,7 +297,9 @@ def build_video(job_id, job_dir, image_paths, audio_path, quality, prompt, scene
             cmd = ["ffmpeg","-y","-loop","1","-framerate","25","-threads","1","-i",img_path,
                    "-vf",vf,"-t",f"{clip_durations[i]:.3f}","-c:v","libx264","-pix_fmt","yuv420p",
                    "-r","25","-preset",prof["preset"],"-crf",str(prof["crf"]),
-                   "-x264-params",f"rc-lookahead={prof['lookahead']}:ref=1:threads=1",str(clip_out)]
+                   "-maxrate",prof["maxrate"],"-bufsize",prof["bufsize"],
+                   "-profile:v","high","-tune","stillimage",
+                   "-x264-params",f"rc-lookahead={prof['lookahead']}:ref=3:threads=1",str(clip_out)]
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             try: _, se = proc.communicate(timeout=240)
             except subprocess.TimeoutExpired: proc.kill(); proc.communicate(); raise RuntimeError(f"Clip {i+1} timed out")
@@ -316,7 +335,37 @@ def build_video(job_id, job_dir, image_paths, audio_path, quality, prompt, scene
     except Exception as e:
         import traceback; traceback.print_exc()
         jobs[job_id].update({"status":"error","message":str(e),"progress":0})
-        shutil.rmtree(str(job_dir), ignore_errors=True)
+        raise RuntimeError(str(e))
+
+
+def build_video(job_id, job_dir, image_paths, audio_path, quality, prompt, scene_duration, output_path, lock_quality=False):
+    attempts = [quality] if lock_quality else QUALITY_FALLBACKS.get(quality, [DEFAULT_QUALITY])
+    errors = []
+    for idx, q in enumerate(attempts):
+        if idx > 0:
+            jobs[job_id].update({
+                "status": "processing",
+                "progress": 5,
+                "message": f"{quality} render failed, retrying with {q}..."
+            })
+        try:
+            _build_video_once(job_id, job_dir, image_paths, audio_path, q, prompt, scene_duration, output_path)
+            if jobs.get(job_id, {}).get("status") == "done":
+                jobs[job_id]["rendered_quality"] = q
+            if q != quality and jobs.get(job_id, {}).get("status") == "done":
+                msg = jobs[job_id].get("message", "Done")
+                jobs[job_id]["message"] = f"{msg} (fallback quality: {q})"
+            return
+        except Exception as e:
+            errors.append(f"{q}: {e}")
+            continue
+
+    jobs[job_id].update({
+        "status": "error",
+        "progress": 0,
+        "message": "All quality attempts failed: " + " | ".join(errors)
+    })
+    shutil.rmtree(str(job_dir), ignore_errors=True)
 
 
 # ═══ ROUTES ══════════════════════════════════════════════════════════════════
@@ -334,6 +383,7 @@ def generate_video():
         images_b64     = data.get("images", [])
         audio_b64      = data.get("audio")
         quality        = data.get("quality", DEFAULT_QUALITY)
+        lock_quality   = bool(data.get("lock_quality", False))
         prompt         = str(data.get("prompt", "")).strip()
         scene_duration = float(data.get("scene_duration", 5))
 
@@ -367,10 +417,10 @@ def generate_video():
             audio_path = str(ap)
 
         output_path = job_dir / "output.mp4"
-        jobs[job_id] = {"status":"queued","progress":0,"message":"Queued...","output_path":None}
+        jobs[job_id] = {"status":"queued","progress":0,"message":"Queued...","output_path":None,"requested_quality":quality,"rendered_quality":None,"lock_quality":lock_quality}
 
         threading.Thread(target=build_video,
-                         args=(job_id,job_dir,image_paths,audio_path,quality,prompt,scene_duration,output_path),
+                         args=(job_id,job_dir,image_paths,audio_path,quality,prompt,scene_duration,output_path,lock_quality),
                          daemon=True).start()
 
         return jsonify({"job_id": job_id})

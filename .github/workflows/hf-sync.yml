@@ -33,6 +33,11 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
+          if [ -z "${HF_TOKEN}" ]; then
+            echo "HF_TOKEN secret is missing"
+            exit 1
+          fi
+
           cd hf-sync
 
           git init

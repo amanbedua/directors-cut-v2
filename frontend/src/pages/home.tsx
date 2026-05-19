@@ -3,9 +3,10 @@ import { API_BASE_URL } from "@/config";
 
 type Quality = "480p" | "720p" | "1080p";
 type Status = "idle" | "processing" | "done" | "error";
+type UploadMode = "fast" | "hq";
 
 // Compress image to max 1200px wide, 80% JPEG quality — keeps payload small
-function compressImage(file: File, maxW = 1200): Promise<string> {
+function compressImage(file: File, maxW = 1200, jpegQuality = 0.82): Promise<string> {
   return new Promise((res, rej) => {
     const img = new Image();
     const url = URL.createObjectURL(file);
@@ -18,7 +19,7 @@ function compressImage(file: File, maxW = 1200): Promise<string> {
       canvas.height = h;
       canvas.getContext("2d")!.drawImage(img, 0, 0, w, h);
       URL.revokeObjectURL(url);
-      res(canvas.toDataURL("image/jpeg", 0.82));
+      res(canvas.toDataURL("image/jpeg", jpegQuality));
     };
     img.onerror = rej;
     img.src = url;
@@ -43,6 +44,7 @@ export default function Home() {
   const [audioFile, setAudioFile] = useState<File | null>(null);
   const [quality, setQuality] = useState<Quality>("480p");
   const [duration, setDuration] = useState(4);
+  const [uploadMode, setUploadMode] = useState<UploadMode>("fast");
   const [prompt, setPrompt] = useState("");
   const [status, setStatus] = useState<Status>("idle");
   const [progress, setProgress] = useState(0);
@@ -103,10 +105,16 @@ export default function Home() {
     const t0 = Date.now();
 
     try {
-      // Step 1: Compress images
-      setProgressMsg("Compressing images…");
+      // Step 1: Prepare images
+      setProgressMsg(uploadMode === "hq" ? "Preparing original images…" : "Compressing images…");
       setProgress(5);
-      const compressed = await Promise.all(images.map(f => compressImage(f)));
+      const preparedImages = uploadMode === "hq"
+        ? await Promise.all(images.map(f => fileToB64(f)))
+        : await Promise.all(images.map(f => {
+            const maxW = quality === "1080p" ? 1920 : quality === "720p" ? 1600 : 1200;
+            const jpegQ = quality === "1080p" ? 0.94 : quality === "720p" ? 0.9 : 0.86;
+            return compressImage(f, maxW, jpegQ);
+          }));
 
       setProgress(12);
       setProgressMsg("Reading audio…");
@@ -115,16 +123,17 @@ export default function Home() {
 
       // Step 2: Start job (quick response — just returns job_id)
       setProgress(15);
-      const totalKB = Math.round(compressed.reduce((s, b) => s + b.length * 0.75 / 1024, 0));
+      const totalKB = Math.round(preparedImages.reduce((s, b) => s + b.length * 0.75 / 1024, 0));
       setProgressMsg(`Uploading ${images.length} scenes (${totalKB} KB)…`);
 
       const startResp = await fetch(API_BASE_URL + "/generate-video", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          images: compressed,
+          images: preparedImages,
           audio: b64Audio,
           quality,
+          lock_quality: uploadMode === "hq",
           prompt: prompt.trim(),
           scene_duration: duration,
         }),
@@ -235,7 +244,7 @@ export default function Home() {
               onChange={e => { addImages([...(e.target.files || [])]); e.target.value = ""; }} />
             <div style={S.uploadIcon}>⬆</div>
             <div style={S.uploadTitle}>Drop images here or tap to upload</div>
-            <div style={S.uploadSub}>JPG, PNG, WEBP · Max 20 images · Auto-compressed</div>
+            <div style={S.uploadSub}>JPG, PNG, WEBP · Max 20 images · {uploadMode === "hq" ? "Original upload (best quality)" : "Auto-compressed"}</div>
           </div>
           {images.length > 0 && (
             <div style={S.imgGrid}>
@@ -278,6 +287,13 @@ export default function Home() {
                 <option value="480p">480p — Fast</option>
                 <option value="720p">720p — HD</option>
                 <option value="1080p">1080p — Full HD</option>
+              </select>
+            </div>
+            <div>
+              <div style={S.settingLabel}>Upload Mode</div>
+              <select value={uploadMode} onChange={e => setUploadMode(e.target.value as UploadMode)} style={S.select}>
+                <option value="fast">Fast (compressed)</option>
+                <option value="hq">HQ (original + lock quality)</option>
               </select>
             </div>
             <div>

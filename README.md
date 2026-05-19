@@ -40,14 +40,14 @@ directors-cut-v2/
 ### Frontend (Render)
 - Push any change to `frontend/` on `main` branch  
 - Render auto-detects via `render.yaml`
-- Build: `npm install && npm run build` inside `frontend/`
-- Publish: `frontend/dist/`
+- Build command (Render): `cd frontend && npm install && npm run build`
+- Publish directory: `frontend/dist/`
 
 ## API Routes
 
 | Method | Route | Description |
 |--------|-------|-------------|
-| POST | `/generate-video` | Start video job → returns `{ job_id }` |
+| POST | `/generate-video` | Start video job → returns `{ job_id }` (supports `quality` + optional `lock_quality`) |
 | GET | `/status/<job_id>` | Poll progress → `{ status, progress, message }` |
 | GET | `/download/<job_id>` | Download finished video |
 | GET | `/health` | Health check |
@@ -67,3 +67,11 @@ cd frontend
 npm install
 npm run dev
 ```
+
+
+## Environment Variables
+
+### Backend (HF Space)
+- `GEMINI_API_KEY`: required for AI director planning.
+- `ALLOWED_ORIGINS`: optional comma-separated frontend origins for CORS (example: `https://directors-cut-v2-2.onrender.com,http://localhost:5173`).
+

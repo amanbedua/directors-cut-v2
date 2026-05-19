@@ -1,8 +1,8 @@
 ---
 title: "Directors Cut Backend"
 emoji: "🎬"
-colorFrom: yellow
-colorTo: indigo
+colorFrom: "blue"
+colorTo: "purple"
 sdk: docker
 sdk_version: "1.0.0"
 python_version: "3.11"
